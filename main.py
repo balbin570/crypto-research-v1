@@ -2586,7 +2586,7 @@ async def funding_v21_profitability_diagnostics(
                 "from_2025":summary([r for r in selected if r["entry_year"]>=2025],fee,slip),
                 "by_entry_year":{str(y):summary([r for r in selected if r["entry_year"]==y],fee,slip)
                     for y in sorted(set(r["entry_year"] for r in selected))}})
-    return {"project":"CRYPTO-RESEARCH-V1","version":"2.1.0",
+    return {"project":"CRYPTO-RESEARCH-V1","version":"2.2.0",
         "model":"FUNDING_VS_BASIS_VS_COST_YEARLY_DECOMPOSITION",
         "paper_only":True,"trading":False,"orders":False,"symbol":symbol,"days":days,
         "spot_notional_usdt":spot_notional_usdt,
@@ -2604,4 +2604,105 @@ async def funding_v21_profitability_diagnostics(
             "45-day positions can overlap; totals are not portfolio CAGR.",
             "Historical filters were examined on the same data; not out-of-sample validation.",
             "No intraday liquidation, basis path, ADL, or margin simulation.",
+            "PAPER ONLY; NO ORDERS."]}
+
+
+@app.get("/funding/v22-holding-period-research")
+async def funding_v22_holding_period_research(
+    symbol: Literal["BTCUSDT","ETHUSDT","SOLUSDT"]="BTCUSDT",
+    days: int=Query(1095,ge=365,le=1095),
+    spot_notional_usdt: float=Query(1000.0,gt=0,le=1000000),
+):
+    """Compare 7/14/21/30/45d holds and past-only early exits. PAPER ONLY."""
+    import bisect, statistics
+    DAY=86400000
+    baseline=await funding_v15_comparison(
+        symbol=symbol,days=days,fee_per_fill_bps=0.0,
+        slippage_per_fill_bps=0.0,financing_annual_pct=0.0)
+    anchor_rows=[r for r in baseline["monthly_matched_entries"] if r["horizon_days"]==45]
+    now=datetime.now(timezone.utc)
+    first=datetime(now.year,now.month,1,tzinfo=timezone.utc)
+    end_ms=int(first.timestamp()*1000)-DAY
+    start_ms=end_ms-days*DAY
+    spot,perp,events=await _archive_bundle(symbol,start_ms-32*DAY,end_ms)
+    event_ts=[t for t,_ in events]
+    rules={
+        "ALL_MONTHLY":lambda r:True,
+        "PRIOR_7D_POSITIVE":lambda r:r["prior_7d_raw_rate_pct"]>0,
+        "PRIOR_30D_GE_0_30PCT":lambda r:r["prior_30d_raw_rate_pct"]>=0.30,
+    }
+    holds=[7,14,21,30,45]
+    cost_cases={"LOW":(2,1),"BASE":(10,2),"HIGH":(15,5)}
+    def evaluate(entry,exit_day,fee,slip):
+        t=int(datetime.strptime(entry["entry_utc"],"%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
+        x=t+exit_day*DAY
+        s0,s1=spot[t],spot[x]
+        f0,f1=perp[t],perp[x]
+        i=bisect.bisect_right(event_ts,t)
+        j=bisect.bisect_left(event_ts,x)
+        funding=100*sum(rate*perp[(ts//DAY)*DAY]/s0 for ts,rate in events[i:j])
+        basis=100*((s1-s0)+(f0-f1))/s0
+        # Use actual entry/exit notionals for four execution fills.
+        execution=(fee+slip)/100*(1+s1/s0+f0/s0+f1/s0)
+        return {"net":funding+basis-execution,"funding":funding,
+                "basis":basis,"execution":execution}
+    def choose_exit(entry,rule):
+        if rule=="FIXED":
+            return None
+        t=int(datetime.strptime(entry["entry_utc"],"%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
+        # Trigger at UTC daily open, using funding events strictly before decision time.
+        for d in range(7,46):
+            decision=t+d*DAY
+            if decision not in spot or decision not in perp:
+                continue
+            lo=bisect.bisect_left(event_ts,decision-7*DAY)
+            hi=bisect.bisect_left(event_ts,decision)
+            window=[r for _,r in events[lo:hi]]
+            if len(window)<10:
+                continue
+            if rule=="LAST_7D_NONPOSITIVE" and sum(window)<=0:
+                return d
+        return 45
+    results=[]
+    for name,filter_fn in rules.items():
+        selected=[r for r in anchor_rows if filter_fn(r)]
+        for strategy in [f"FIXED_{d}D" for d in holds]+["EARLY_EXIT_LAST_7D_NONPOSITIVE_MAX45D"]:
+            for cost_name,(fee,slip) in cost_cases.items():
+                records=[]
+                for r in selected:
+                    h=(int(strategy.split("_")[1][:-1]) if strategy.startswith("FIXED_")
+                       else choose_exit(r,"LAST_7D_NONPOSITIVE"))
+                    t=int(datetime.strptime(r["entry_utc"],"%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()*1000)
+                    if t+h*DAY not in spot or t+h*DAY not in perp:
+                        continue
+                    outcome=evaluate(r,h,fee,slip)
+                    records.append({"year":r["entry_year"],"hold":h,**outcome})
+                def summarize(items):
+                    if not items:return {"trades":0}
+                    return {"trades":len(items),
+                        "net_proxy_total_usdt":round(sum(z["net"] for z in items)*spot_notional_usdt/100,4),
+                        "mean_net_proxy_pct":round(statistics.mean(z["net"] for z in items),6),
+                        "positive_trades":sum(z["net"]>0 for z in items),
+                        "mean_days_held":round(statistics.mean(z["hold"] for z in items),2),
+                        "funding_proxy_total_usdt":round(sum(z["funding"] for z in items)*spot_notional_usdt/100,4),
+                        "basis_total_usdt":round(sum(z["basis"] for z in items)*spot_notional_usdt/100,4),
+                        "execution_cost_total_usdt":round(sum(z["execution"] for z in items)*spot_notional_usdt/100,4)}
+                results.append({"entry_filter":name,"exit_rule":strategy,"cost_case":cost_name,
+                    "pre_2025":summarize([z for z in records if z["year"]<2025]),
+                    "from_2025":summarize([z for z in records if z["year"]>=2025]),
+                    "year_2026":summarize([z for z in records if z["year"]==2026])})
+    return {"project":"CRYPTO-RESEARCH-V1","version":"2.2.0",
+        "model":"HOLDING_PERIOD_AND_EARLY_EXIT_RESEARCH",
+        "paper_only":True,"trading":False,"orders":False,
+        "symbol":symbol,"days":days,"spot_notional_usdt":spot_notional_usdt,
+        "settlement_funding_verified":False,
+        "data_audit":baseline["data_audit"],"results":results,
+        "limitations":[
+            "Funding uses daily-open perpetual price proxy, not settlement mark.",
+            "No actual funding ledger reconciliation or financing/opportunity cost.",
+            "Monthly entry anchors are shared across horizons; not independent tests.",
+            "Early exit checks the preceding seven days only at daily UTC opens.",
+            "Strategies are inspected on the same historical data; not out-of-sample.",
+            "Intraday margin, liquidation, ADL, and order-book liquidity not modeled.",
+            "Summed PnL is not CAGR or an executable portfolio return.",
             "PAPER ONLY; NO ORDERS."]}
