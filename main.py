@@ -7,7 +7,7 @@ from typing import Literal
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="CRYPTO-RESEARCH-V1", version="1.5.0")
+app = FastAPI(title="CRYPTO-RESEARCH-V1", version="1.7.0")
 SPOT = "https://data-api.binance.vision"
 FUTURES = "https://fapi.binance.com"
 SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
@@ -2103,5 +2103,160 @@ async def funding_v16_robustness(
             "Overlapping trades are NOT independent and reported averages are NOT portfolio returns.",
             "Historical filter selection is subject to selection bias; no new independent forward sample.",
             "No actual orders, trading, or verified realizable net profitability."
+        ]
+    }
+
+
+@app.get("/funding/v17-portfolio-audit")
+async def funding_v17_portfolio_audit(
+    symbol: Literal["BTCUSDT","ETHUSDT","SOLUSDT"]="BTCUSDT",
+    days: int=Query(1095,ge=365,le=1095),
+    starting_capital_usdt: float=Query(10000.0,gt=0,le=10000000),
+    spot_notional_usdt: float=Query(1000.0,gt=0,le=1000000),
+    perp_margin_fraction: float=Query(0.25,ge=0.05,le=1),
+    reserve_fraction: float=Query(0.25,ge=0,le=2),
+    financing_annual_pct: float=Query(5.0,ge=0,le=30),
+    fee_per_fill_bps: float=Query(10.0,ge=0,le=50),
+    slippage_per_fill_bps: float=Query(2.0,ge=0,le=50),
+):
+    """Portfolio cash allocation / funding proxy data audit; no intratrade MTM."""
+    import statistics
+    from collections import Counter
+    base=await funding_v15_comparison(
+        symbol=symbol,days=days,fee_per_fill_bps=fee_per_fill_bps,
+        slippage_per_fill_bps=slippage_per_fill_bps,financing_annual_pct=0.0
+    )
+    all_rows=[r for r in base["monthly_matched_entries"] if r["horizon_days"]==45]
+    if not all_rows:
+        raise HTTPException(status_code=503,detail="45 günlük ortak giriş verisi yok")
+    filters={
+        "ALL_MONTHLY":lambda r:True,
+        "PRIOR_7D_POSITIVE":lambda r:r["prior_7d_raw_rate_pct"]>0,
+        "PRIOR_30D_GE_0_30PCT":lambda r:r["prior_30d_raw_rate_pct"]>=0.30,
+    }
+    unit_required=spot_notional_usdt*(1+perp_margin_fraction+reserve_fraction)
+    if unit_required>starting_capital_usdt:
+        raise HTTPException(status_code=422,detail="Başlangıç sermayesi tek pozisyon için yetersiz")
+    scenarios=[]
+    for name,eligible in filters.items():
+        signals=sorted((r for r in all_rows if eligible(r)),key=lambda r:r["entry_utc"])
+        # Chronological, fixed notional, cash-settled after 45 days. No leverage or
+        # compounding; unrealized P&L is NOT used to fund additional positions.
+        events=[]
+        for r in signals:
+            entry=datetime.fromisoformat(r["entry_utc"]).date()
+            exit_date=entry+timedelta(days=45)
+            events.append((entry,1,r))
+            events.append((exit_date,0,r))
+        # Exits processed before entries on the same date.
+        events.sort(key=lambda x:(x[0],x[1]))
+        cash=starting_capital_usdt
+        locked=0.0
+        open_trades={}
+        peak_positions=0
+        peak_locked=0.0
+        accepted=skipped=0
+        realized=0.0
+        equity_path=[{"date":signals[0]["entry_utc"] if signals else None,
+                      "realized_equity_usdt":round(starting_capital_usdt,2)}]
+        closed=[]
+        for day,kind,r in events:
+            key=r["entry_utc"]
+            if kind==1:
+                if cash+1e-8>=unit_required:
+                    cash-=unit_required
+                    locked+=unit_required
+                    open_trades[key]=True
+                    accepted+=1
+                    peak_positions=max(peak_positions,len(open_trades))
+                    peak_locked=max(peak_locked,locked)
+                else:
+                    skipped+=1
+            elif key in open_trades:
+                open_trades.pop(key)
+                # P&L measured in spot-entry notional. Borrow cost is a
+                # simplified annual rate on full spot notional for 45 days.
+                net_pct=r["net_proxy_pct"]-financing_annual_pct*45/365
+                pnl=spot_notional_usdt*net_pct/100
+                cash+=unit_required+pnl
+                locked-=unit_required
+                realized+=pnl
+                closed.append({"entry_utc":key,"exit_utc":day.isoformat(),
+                               "net_usdt":round(pnl,4),"net_pct_spot":round(net_pct,6)})
+                equity_path.append({"date":day.isoformat(),
+                                    "realized_equity_usdt":round(cash+locked,4)})
+        peak_equity=starting_capital_usdt
+        max_realized_dd=0.0
+        for point in equity_path:
+            v=point["realized_equity_usdt"]
+            peak_equity=max(peak_equity,v)
+            max_realized_dd=max(max_realized_dd,(peak_equity-v)/peak_equity*100)
+        recent=[t for t in closed if t["entry_utc"]>="2025-01-01"]
+        scenarios.append({
+            "strategy":name,"signals":len(signals),"accepted":accepted,
+            "skipped_insufficient_free_cash":skipped,"closed":len(closed),
+            "peak_simultaneous_positions":peak_positions,
+            "peak_locked_capital_usdt":round(peak_locked,2),
+            "ending_realized_equity_usdt":round(cash+locked,4),
+            "total_realized_pnl_usdt":round(realized,4),
+            "total_realized_return_pct_initial_capital":round(realized/starting_capital_usdt*100,6),
+            "max_drawdown_realized_only_pct":round(max_realized_dd,6),
+            "recent_2025_2026_closed":len(recent),
+            "recent_2025_2026_realized_pnl_usdt":round(sum(t["net_usdt"] for t in recent),4),
+            "equity_path_realized_only":equity_path,
+            "closed_trade_pnl":closed,
+        })
+    # Audit funding-rate sums against daily-open estimated settlement values.
+    # This is a proxy consistency diagnostic, NOT settlement-time reconciliation.
+    diffs=[r["funding_daily_open_proxy_pct"]-r["raw_rate_sum_pct"] for r in all_rows]
+    sorted_abs=sorted(abs(d) for d in diffs)
+    audit={
+        "settlement_mark_price_available":False,
+        "actual_funding_cashflows_verified":False,
+        "funding_rate_events_in_archive":base["data_audit"]["funding_events_in_window"],
+        "monthly_45d_samples":len(all_rows),
+        "funding_event_counts":dict(Counter(r["events"] for r in all_rows)),
+        "proxy_minus_raw_rate_mean_percentage_points":round(statistics.mean(diffs),6),
+        "proxy_minus_raw_rate_max_abs_percentage_points":round(max(sorted_abs),6),
+        "proxy_minus_raw_rate_median_abs_percentage_points":round(statistics.median(sorted_abs),6),
+        "top_five_proxy_discrepancies":[{
+            "entry_utc":r["entry_utc"],
+            "raw_funding_rate_sum_pct":r["raw_rate_sum_pct"],
+            "daily_open_proxy_pct":r["funding_daily_open_proxy_pct"],
+            "difference_percentage_points":round(r["funding_daily_open_proxy_pct"]-r["raw_rate_sum_pct"],6)
+        } for r in sorted(all_rows,key=lambda x:abs(x["funding_daily_open_proxy_pct"]-x["raw_rate_sum_pct"]),reverse=True)[:5]],
+        "status":"PROXY_ONLY_NOT_VERIFIED",
+    }
+    return {
+        "project":"CRYPTO-RESEARCH-V1","version":"1.7.0",
+        "model":"PORTFOLIO_CASH_ALLOCATION_AND_FUNDING_PROXY_AUDIT",
+        "paper_only":True,"trading":False,"orders":False,
+        "symbol":symbol,"days":days,
+        "inputs":{
+            "starting_capital_usdt":starting_capital_usdt,
+            "spot_notional_per_position_usdt":spot_notional_usdt,
+            "perp_margin_fraction":perp_margin_fraction,
+            "reserve_fraction":reserve_fraction,
+            "capital_locked_per_position_usdt":round(unit_required,2),
+            "financing_annual_pct":financing_annual_pct,
+            "fee_per_fill_bps":fee_per_fill_bps,
+            "slippage_per_fill_bps":slippage_per_fill_bps,
+            "hold_days":45,
+        },
+        "source_audit":base["data_audit"],
+        "funding_proxy_audit":audit,
+        "portfolio_scenarios":scenarios,
+        "limitations":[
+            "Settlement-time mark prices and actual funding cashflows NOT available or verified.",
+            "Funding proxy uses daily futures open; raw funding rate sums are NOT cashflows.",
+            "Realized-only drawdown ignores interim unrealized losses and margin calls.",
+            "No liquidation, ADL, variation margin, or intraday basis stress simulation.",
+            "Collateral and reserve are static assumptions; no exchange margin requirements checked.",
+            "Financing is a flat hypothetical annual rate charged on spot notional.",
+            "Fixed position notional and no reinvestment; overlapping signals require separate locked capital.",
+            "Only first-of-month entry signals and completed 45-day holding windows included.",
+            "Historical selection bias and no independent forward validation.",
+            "Portfolio returns are historical PROXY simulations, not executable returns.",
+            "NO REAL ORDERS; PAPER ONLY."
         ]
     }
