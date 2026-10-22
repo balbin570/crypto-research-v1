@@ -32,7 +32,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "OK", "utc": datetime.now(timezone.utc).isoformat(), "paper_only": True, "trading": False, "orders": False, "version": "0.6.1"}
+    return {"status": "OK", "utc": datetime.now(timezone.utc).isoformat(), "paper_only": True, "trading": False, "orders": False, "version": "0.6.2"}
 
 @app.get("/mr/signal")
 async def mr_signal(symbol: str = Query("BTCUSDT"), interval: Literal["5m", "15m", "1h"] = "15m"):
@@ -256,7 +256,7 @@ async def mr_cost_analysis(
                 "max_closed_trade_drawdown_pct": r["summary"]["max_closed_trade_drawdown_pct"],
             })
     return {
-        "project": "CRYPTO-RESEARCH-V1", "version": "0.6.1",
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.6.2",
         "symbol": symbol, "interval": interval, "days": days,
         "data_bars": len(raw), "paper_only": True, "orders": False,
         "scenarios": results,
@@ -452,7 +452,7 @@ async def funding_backtest(
     }
 
 # Ensure the old routes remain unchanged. Version is informational only.
-app.version = '0.6.1'
+app.version = '0.6.2'
 
 
 # V0.5: Funding carry diagnostics, strictly descriptive and research-only.
@@ -531,7 +531,7 @@ async def funding_carry_analysis(
             "latest_funding_minus_cost_pct": round_or_none(latest[1] - assumed_round_trip_cost_pct) if latest else None,
         })
     return {
-        "project": "CRYPTO-RESEARCH-V1", "version": "0.6.1",
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.6.2",
         "model": "FA_B_FUNDING_PERSISTENCE_DIAGNOSTIC",
         "symbol": symbol, "days": days, "paper_only": True, "orders": False,
         "period_funding_events": len(in_period),
@@ -555,6 +555,30 @@ async def funding_carry_analysis(
     }
 
 
+# Daily price history minimizes Binance requests for long-window research.
+async def _daily_history(base: str, symbol: str, start_ms: int, end_ms: int, path: str):
+    source = "SPOT" if base == SPOT else "FUTURES"
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            response = await client.get(f"{base}{path}", params={
+                "symbol": symbol, "interval": "1d", "startTime": start_ms,
+                "endTime": end_ms, "limit": 1000,
+            })
+            response.raise_for_status()
+            batch = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+        raise HTTPException(503, detail={
+            "error": "Günlük fiyat verisi alınamadı", "source": source,
+            "upstream_http_status": status,
+            "note": "HTTP 418: Binance geçici IP engeli; yeniden denemeleri durdurup engelin kalkmasını bekleyin."
+                    if status == 418 else "Veri kaynağı isteği başarısız oldu."
+        }) from exc
+    if not isinstance(batch, list):
+        raise HTTPException(502, detail=f"{source} beklenmeyen veri biçimi")
+    return {int(row[0]): float(row[1]) for row in batch if int(row[0]) <= end_ms}
+
+
 # V0.6: Historical spot/perpetual carry with realized funding and basis PnL.
 # This is a retrospective rolling-window diagnostic, NOT a forward-entry backtest.
 @app.get("/funding/carry-basis-analysis")
@@ -569,17 +593,17 @@ async def funding_carry_basis_analysis(
     hour_ms = 3_600_000
     day_ms = 24 * hour_ms
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    # Last fully completed hour's OPEN is an available historical price.
-    end_ms = (now_ms // hour_ms - 1) * hour_ms
+    # Use UTC midnight OPEN for both legs; last completed UTC date only.
+    end_ms = (now_ms // day_ms - 1) * day_ms
     start_ms = end_ms - days * day_ms
     spot, perp, events = await asyncio.gather(
-        _hourly_history(SPOT, symbol, start_ms, end_ms, "/api/v3/klines"),
-        _hourly_history(FUTURES, symbol, start_ms, end_ms, "/fapi/v1/klines"),
+        _daily_history(SPOT, symbol, start_ms, end_ms, "/api/v3/klines"),
+        _daily_history(FUTURES, symbol, start_ms, end_ms, "/fapi/v1/klines"),
         _funding_history(symbol, start_ms, end_ms),
     )
     common = sorted(set(spot) & set(perp))
-    if len(common) < days * 20 or len(events) < days:
-        raise HTTPException(503, "Yeterli eşleşen saatlik spot/perp veya funding geçmişi yok")
+    if len(common) < days * 0.9 or len(events) < days:
+        raise HTTPException(503, "Yeterli eşleşen günlük spot/perp veya funding geçmişi yok")
     event_times = [t for t, _ in events]
     durations = (7, 14, 30, 45)
     cost_scenarios = [
@@ -592,12 +616,12 @@ async def funding_carry_basis_analysis(
         duration_ms = duration_days * day_ms
         records = []
         # Each entry is a sampled historical start, not a trading signal.
-        for entry_t in range(start_ms, end_ms - duration_ms + 1, sample_every_hours * hour_ms):
+        for entry_t in range(start_ms, end_ms - duration_ms + 1, max(day_ms, sample_every_hours * hour_ms)):
             exit_t = entry_t + duration_ms
             if entry_t not in spot or entry_t not in perp or exit_t not in spot or exit_t not in perp:
                 continue
-            # Reject missing interior hourly bars, including gaps in either market.
-            if any(t not in spot or t not in perp for t in range(entry_t, exit_t + 1, hour_ms)):
+            # Reject missing interior daily bars, including gaps in either market.
+            if any(t not in spot or t not in perp for t in range(entry_t, exit_t + 1, day_ms)):
                 continue
             s0, s1, f0, f1 = spot[entry_t], spot[exit_t], perp[entry_t], perp[exit_t]
             if min(s0, s1, f0, f1) <= 0:
@@ -613,7 +637,7 @@ async def funding_carry_basis_analysis(
                 continue
             funding_pct = 0.0
             for t, rate in funding_events:
-                proxy_hour = (t // hour_ms) * hour_ms
+                proxy_hour = (t // day_ms) * day_ms
                 if proxy_hour not in perp:
                     funding_pct = None
                     break
@@ -662,25 +686,25 @@ async def funding_carry_basis_analysis(
         })
     return {
         "project": "CRYPTO-RESEARCH-V1",
-        "version": "0.6.1",
+        "version": "0.6.2",
         "model": "FA_B_RETROSPECTIVE_CARRY_BASIS",
         "symbol": symbol,
         "days": days,
         "sample_every_hours": sample_every_hours,
         "paper_only": True,
         "orders": False,
-        "matched_hourly_bars": len(common),
+        "matched_daily_bars": len(common),
         "historical_funding_events": len(events),
         "analyses": analyses,
         "limitations": [
             "Retrospective sampled windows; no forward signal or tradable entry rule.",
             "Windows overlap and are not independent; do not compound their returns.",
-            "Funding uses historical realized rates and hourly perp-open notional proxy, not exact funding mark.",
+            "Funding uses historical realized rates and DAILY perp-open notional proxy, not exact funding mark.",
             "Spot and perpetual hourly opens are not guaranteed simultaneous executable fills.",
             "Cost scenarios include illustrative fees only; extra spread, slippage and market impact are excluded.",
             "No margin, liquidation, financing, borrow, collateral, transfer or intratrade drawdown model.",
             "Results are normalized to entry spot notional, not total committed capital.",
-            "Missing hourly data and large funding-event gaps cause windows to be excluded.",
+            "Missing daily data and large funding-event gaps cause windows to be excluded.",
             "No orders, no live trading, no proof of future profitability.",
         ],
     }
