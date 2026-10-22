@@ -7,7 +7,7 @@ from typing import Literal
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="CRYPTO-RESEARCH-V1", version="0.7.1")
+app = FastAPI(title="CRYPTO-RESEARCH-V1", version="1.4.0")
 SPOT = "https://data-api.binance.vision"
 FUTURES = "https://fapi.binance.com"
 SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
@@ -1651,5 +1651,170 @@ async def funding_v13_audit(
             "Archive quality checks do not establish exchange-level reconciliation.",
             "Development and validation periods were previously inspected; not independent proof.",
             "Paper research only. No orders or trading."
+        ]
+    }
+
+
+# V1.4 — bundled independent diagnostics. No trading or order functions.
+@app.get("/funding/v14-research")
+async def funding_v14_research(
+    symbol: Literal["BTCUSDT","ETHUSDT","SOLUSDT"] = "BTCUSDT",
+    days: int = Query(1095, ge=365, le=1095),
+    fee_per_fill_bps: float = Query(10.0, ge=0, le=50),
+    slippage_per_fill_bps: float = Query(2.0, ge=0, le=50),
+    financing_annual_pct: float = Query(0.0, ge=0, le=30),
+):
+    """Funding regime, data completeness, holding windows, cost break-even.
+
+    Important: only archived funding RATES are exact; cashflows use daily-open
+    approximations. We intentionally do not label them settlement-verified.
+    """
+    from collections import Counter, defaultdict
+    import statistics
+    DAY = 86400000
+    audit = await funding_v13_audit(
+        symbol=symbol, days=days, fee_per_fill_bps=fee_per_fill_bps,
+        slippage_per_fill_bps=slippage_per_fill_bps,
+        financing_annual_pct=financing_annual_pct)
+    fixed = next(x for x in audit["strategies"] if x["exit_rule"]=="fixed")
+    early = next(x for x in audit["strategies"] if x["exit_rule"]=="last_3d_negative")
+    trades = fixed["trades"] + early["trades"]
+    a = min(int(datetime.fromisoformat(t["entry_utc"]).timestamp()*1000) for t in trades)
+    b = max(int(datetime.fromisoformat(t["exit_utc"]).timestamp()*1000) for t in trades)
+    spot, perp, events = await _archive_bundle(symbol,a-45*DAY,b+DAY)
+    # Monthly rate sums and negative-event frequency; partial months explicitly flagged.
+    months=defaultdict(list)
+    for ts,r in events:
+        key=datetime.fromtimestamp(ts/1000,timezone.utc).strftime("%Y-%m")
+        months[key].append((ts,r))
+    monthly=[]
+    for month, values in sorted(months.items()):
+        monthly.append({
+            "month":month,"events":len(values),
+            "raw_funding_rate_sum_pct":round(100*sum(r for _,r in values),6),
+            "negative_event_pct":round(100*sum(r<0 for _,r in values)/len(values),2),
+            "partial_month_possible":month in (min(months),max(months))
+        })
+    # Interval distribution detects 8h / 4h / 1h schedule changes and short gaps.
+    interval_counts=Counter()
+    for (t0,_),(t1,_) in zip(events,events[1:]):
+        hours=(t1-t0)/3600000
+        interval_counts[str(round(hours,2))]+=1
+    # Prospectively defined trailing-rate signals, calculated ONLY from prior events.
+    # Descriptive forward sums of rates (not P&L) at non-overlapping monthly anchors.
+    event_times=[t for t,_ in events]
+    import bisect
+    regimes=[]
+    for month in sorted(months):
+        y,m=map(int,month.split("-"))
+        anchor=int(datetime(y,m,1,tzinfo=timezone.utc).timestamp()*1000)
+        if anchor-30*DAY<a-45*DAY or anchor+30*DAY>b:
+            continue
+        idx=bisect.bisect_left(event_times,anchor)
+        prior7=[r for t,r in events[bisect.bisect_left(event_times,anchor-7*DAY):idx]]
+        prior30=[r for t,r in events[bisect.bisect_left(event_times,anchor-30*DAY):idx]]
+        forward30=[r for t,r in events[idx:bisect.bisect_left(event_times,anchor+30*DAY)]]
+        if len(prior7)<14 or len(prior30)<60 or len(forward30)<60:
+            continue
+        regimes.append({
+            "month":month,"prior_7d_raw_rate_sum_pct":round(100*sum(prior7),6),
+            "prior_30d_raw_rate_sum_pct":round(100*sum(prior30),6),
+            "next_30d_raw_rate_sum_pct":round(100*sum(forward30),6),
+            "prior_7d_positive":sum(prior7)>0,
+            "next_30d_positive":sum(forward30)>0
+        })
+    regime_summary=[]
+    for label, subset in (
+        ("prior_7d_positive",[r for r in regimes if r["prior_7d_positive"]]),
+        ("prior_7d_nonpositive",[r for r in regimes if not r["prior_7d_positive"]])
+    ):
+        regime_summary.append({
+            "group":label,"months":len(subset),
+            "mean_next_30d_raw_rate_sum_pct":round(statistics.mean(
+                r["next_30d_raw_rate_sum_pct"] for r in subset),6) if subset else None,
+            "next_30d_positive_pct":round(100*sum(
+                r["next_30d_positive"] for r in subset)/len(subset),2) if subset else None
+        })
+    # Cost sensitivity on identical entry/exit trades, without reoptimizing signals.
+    sensitivities=[]
+    for name, f, slip, financing in (
+        ("low_cost",2,0,0),
+        ("medium_cost",4,1,0),
+        ("baseline",10,0,0),
+        ("baseline_slip2",10,2,0),
+        ("baseline_slip5",10,5,0),
+        ("baseline_slip2_financing5pct",10,2,5)
+    ):
+        scenario={"scenario":name,"fee_per_fill_bps":f,
+                  "slippage_per_fill_bps":slip,"financing_annual_pct":financing}
+        for strategy in (fixed,early):
+            subset=[t for t in strategy["trades"] if t["partition"]=="validation"]
+            # Recover gross = V1.3 net + selected cost + selected financing.
+            vals=[]
+            break_even=[]
+            for t in subset:
+                baseline=t["execution_cost_pct"]/(fee_per_fill_bps+slippage_per_fill_bps) if (fee_per_fill_bps+slippage_per_fill_bps)>0 else None
+                # When user supplied zero fees, infer baseline 10bps/fill from
+                # underlying trade prices, not a division by zero.
+                if baseline is None:
+                    # Approximate 4 fills with original weighted notional factor.
+                    baseline=0.04
+                gross=t["scenario_net_pct_spot_notional"]+t["execution_cost_pct"]+t["financing_cost_pct"]
+                fin=financing*t["days_held"]/365
+                vals.append(gross-baseline*(f+slip)-fin)
+                if baseline>0:
+                    break_even.append(max(0,(gross-fin)/baseline))
+            key="fixed" if strategy is fixed else "last_3d_negative"
+            scenario[key]={
+                "validation_trades":len(vals),
+                "mean_net_pct_spot_notional":round(statistics.mean(vals),6) if vals else None,
+                "win_rate_pct":round(100*sum(v>0 for v in vals)/len(vals),2) if vals else None,
+                "median_break_even_combined_bps_per_fill":round(statistics.median(break_even),3) if break_even else None
+            }
+        sensitivities.append(scenario)
+    # Duration: preexisting entry/exit logic, compare descriptive results only.
+    hold_groups=[]
+    for strat in (fixed,early):
+        for label,subset in (
+            ("up_to_14d",[t for t in strat["trades"] if t["days_held"]<=14]),
+            ("15_to_29d",[t for t in strat["trades"] if 15<=t["days_held"]<=29]),
+            ("30_to_44d",[t for t in strat["trades"] if 30<=t["days_held"]<=44]),
+            ("45d",[t for t in strat["trades"] if t["days_held"]==45])
+        ):
+            hold_groups.append({
+                "strategy":strat["exit_rule"],"duration":label,
+                "trades":len(subset),
+                "mean_net_pct_spot_notional":round(statistics.mean(
+                    t["scenario_net_pct_spot_notional"] for t in subset),6) if subset else None,
+                "validation_trades":sum(t["partition"]=="validation" for t in subset)
+            })
+    return {
+        "project":"CRYPTO-RESEARCH-V1","version":"1.4.0",
+        "model":"FUNDING_MULTISTUDY_DIAGNOSTIC","paper_only":True,"orders":False,
+        "symbol":symbol,"days":days,
+        "studies":{
+            "archive_quality":audit["archive_quality"],
+            "funding_intervals_hours":dict(interval_counts.most_common(12)),
+            "monthly_funding_rates":monthly,
+            "forward_rate_regimes":{
+                "definition":"Monthly anchor; preceding 7d vs next 30d; raw rates only",
+                "summary":regime_summary,"observations":regimes},
+            "validation_cost_sensitivity":sensitivities,
+            "observed_trade_duration":hold_groups,
+            "strategy_summaries":[{"exit_rule":x["exit_rule"],"summaries":x["summaries"]}
+                                  for x in audit["strategies"]]
+        },
+        "limitations":[
+            "No exact settlement-time perp mark prices: funding cashflow NOT verified.",
+            "Archive rate sum is not a realized portfolio return.",
+            "Funding interval distribution does not by itself prove completeness.",
+            "Regime results describe rates, not executable spot/perp arbitrage P&L.",
+            "Duration groups are observational, not a causal hold-period test.",
+            "Sensitivity uses assumed fees, slippage and financing, not verified user fees.",
+            "Financing uses simple annualized approximation on spot notional.",
+            "Break-even values are per-fill combined fee+slippage assumptions.",
+            "The analyzed periods have already been inspected; not fresh out-of-sample.",
+            "No intraday liquidation, basis intraday extremes, margin or ADL modeling.",
+            "Research only: no live orders."
         ]
     }
