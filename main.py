@@ -1347,3 +1347,110 @@ async def funding_extended_backtest(
             "Historical research only; no live trades or proof of profitability."
         ]
     }
+
+
+# V1.1: year-by-year attribution for the two preselected 45-day research candidates.
+@app.get("/funding/yearly-risk")
+async def funding_yearly_risk(
+    symbol: Literal["BTCUSDT", "ETHUSDT", "SOLUSDT"] = "BTCUSDT",
+    days: int = Query(1095, ge=365, le=1095),
+):
+    import bisect
+    from collections import defaultdict
+    DAY = 86400000
+    # Reuse V1.0 entry/exit engine, preserving all historical rules.
+    original = await funding_extended_backtest(symbol=symbol, days=days,
+                                                lookback_days=7, min_past_funding_pct=0.05)
+    selected = [r for r in original["results"] if r["hold_days"] == 45
+                and r["exit_rule"] in ("fixed", "last_3d_negative")]
+    if not selected:
+        raise HTTPException(503, "V1.0 strateji verisi bulunamadı")
+    all_trades = [t for r in selected for t in r["trades"]]
+    if not all_trades:
+        raise HTTPException(503, "Analiz edilecek işlem bulunamadı")
+    first = min(int(datetime.fromisoformat(t["entry_utc"]).timestamp()*1000) for t in all_trades)
+    last = max(int(datetime.fromisoformat(t["exit_utc"]).timestamp()*1000) for t in all_trades)
+    spot, perp, events = await _archive_bundle(symbol, first-DAY, last+DAY)
+    times = [t for t,_ in events]
+    output = []
+    for strategy in selected:
+        by_year = defaultdict(list)
+        detailed = []
+        for t in strategy["trades"]:
+            a = int(datetime.fromisoformat(t["entry_utc"]).timestamp()*1000)
+            b = int(datetime.fromisoformat(t["exit_utc"]).timestamp()*1000)
+            s0, f0, s1, f1 = spot.get(a), perp.get(a), spot.get(b), perp.get(b)
+            if not all(x is not None and x > 0 for x in (s0, f0, s1, f1)):
+                raise HTTPException(503, "İşlem fiyat arşivi eksik")
+            actual = events[bisect.bisect_right(times,a):bisect.bisect_left(times,b)]
+            if any((ts//DAY)*DAY not in perp for ts,_ in actual):
+                raise HTTPException(503, "Funding fiyat arşivi eksik")
+            funding_pct = 100*sum(rate*perp[(ts//DAY)*DAY]/s0 for ts,rate in actual)
+            basis_pct = 100*((s1-s0)+(f0-f1))/s0
+            gross_pct = funding_pct+basis_pct
+            fee_pct = .1*(1+s1/s0+f0/s0+f1/s0)
+            # Daily synthetic gross marks; NOT margin or liquidation risk.
+            marks=[]
+            for d in range(a+DAY,b+DAY,DAY):
+                if d not in spot or d not in perp:
+                    continue
+                earned=events[bisect.bisect_right(times,a):bisect.bisect_left(times,d)]
+                fp=100*sum(rate*perp[(ts//DAY)*DAY]/s0 for ts,rate in earned)
+                bp=100*((spot[d]-s0)+(f0-perp[d]))/s0
+                marks.append(fp+bp)
+            worst_mark=min(marks) if marks else None
+            peak=0.0
+            max_dd=0.0
+            for mark in marks:
+                peak=max(peak,mark)
+                max_dd=max(max_dd,peak-mark)
+            detail={
+                "entry_utc":t["entry_utc"],"exit_utc":t["exit_utc"],
+                "partition":t["partition"],"days_held":t["days_held"],
+                "exit_reason":t["exit_reason"],
+                "funding_pct":round(funding_pct,6),
+                "basis_pct":round(basis_pct,6),
+                "gross_pct":round(gross_pct,6),
+                "four_fill_fee_baseline_pct":round(fee_pct,6),
+                "net_baseline_pct":round(gross_pct-fee_pct,6),
+                "worst_daily_mark_gross_pct":round(worst_mark,6) if worst_mark is not None else None,
+                "max_daily_peak_to_trough_pct_points":round(max_dd,6)
+            }
+            detailed.append(detail)
+            by_year[datetime.fromisoformat(t["exit_utc"]).year].append(detail)
+        years=[]
+        for year, subset in sorted(by_year.items()):
+            n=len(subset)
+            def mean(field): return round(sum(t[field] for t in subset)/n,6)
+            compounded=1
+            for t in subset: compounded*=1+t["net_baseline_pct"]/100
+            years.append({
+                "exit_year":year,"trades":n,
+                "mean_funding_pct":mean("funding_pct"),
+                "mean_basis_pct":mean("basis_pct"),
+                "mean_fee_pct":mean("four_fill_fee_baseline_pct"),
+                "mean_net_pct":mean("net_baseline_pct"),
+                "positive_net_pct":round(100*sum(t["net_baseline_pct"]>0 for t in subset)/n,2),
+                "illustrative_compounded_net_pct":round(100*(compounded-1),6),
+                "worst_daily_mark_gross_pct":min(t["worst_daily_mark_gross_pct"] for t in subset if t["worst_daily_mark_gross_pct"] is not None),
+            })
+        output.append({"hold_days":45,"exit_rule":strategy["exit_rule"],
+                       "total_trades":len(detailed),"yearly":years,"trades":detailed})
+    return {
+        "project":"CRYPTO-RESEARCH-V1","version":"1.1.0",
+        "model":"FA_B_YEARLY_ATTRIBUTION_RISK","paper_only":True,"orders":False,
+        "symbol":symbol,"days":days,
+        "baseline_fee_model":"10 bps per fill x 4 fills, price-weighted; financing excluded",
+        "results":output,
+        "limitations":[
+            "Calendar year is based on exit date; partial 2023 and 2026 years.",
+            "The two strategies may enter at different dates, so not a matched-trade comparison.",
+            "Synthetic daily spot-long/perp-short marks are not executable liquidation values.",
+            "Intraday extremes, collateral requirements, financing, borrow rates, margin and liquidation are NOT modeled.",
+            "No spread or slippage included beyond illustrative fee scenario.",
+            "Returns relative to spot notional, not actual deployed capital.",
+            "Funding accrual approximates perp notional using daily open.",
+            "Previously inspected history is not independent out-of-sample validation.",
+            "Research paper only; no trading or orders."
+        ]
+    }
