@@ -7,7 +7,7 @@ from typing import Literal
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="CRYPTO-RESEARCH-V1", version="1.4.0")
+app = FastAPI(title="CRYPTO-RESEARCH-V1", version="1.5.0")
 SPOT = "https://data-api.binance.vision"
 FUTURES = "https://fapi.binance.com"
 SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
@@ -1816,5 +1816,160 @@ async def funding_v14_research(
             "The analyzed periods have already been inspected; not fresh out-of-sample.",
             "No intraday liquidation, basis intraday extremes, margin or ADL modeling.",
             "Research only: no live orders."
+        ]
+    }
+
+
+# V1.5: matched-entry holding periods, past-only entry filters, transparent proxy audit.
+@app.get("/funding/v15-comparison")
+async def funding_v15_comparison(
+    symbol: Literal["BTCUSDT","ETHUSDT","SOLUSDT"]="BTCUSDT",
+    days: int=Query(1095,ge=365,le=1095),
+    fee_per_fill_bps: float=Query(10.0,ge=0,le=50),
+    slippage_per_fill_bps: float=Query(2.0,ge=0,le=50),
+    financing_annual_pct: float=Query(0.0,ge=0,le=30),
+):
+    import bisect
+    import statistics
+    from collections import defaultdict
+    DAY=86400000
+    now=datetime.now(timezone.utc)
+    # Use only completed monthly archives, as in the older endpoints.
+    first_of_month=datetime(now.year,now.month,1,tzinfo=timezone.utc)
+    end_ms=int(first_of_month.timestamp()*1000)-DAY
+    start_ms=end_ms-days*DAY
+    warmup_ms=start_ms-32*DAY
+    spot,perp,events=await _archive_bundle(symbol,warmup_ms,end_ms)
+    event_times=[ts for ts,_ in events]
+    event_rates=[r for _,r in events]
+    prefix=[0.0]
+    for rate in event_rates:
+        prefix.append(prefix[-1]+rate)
+    def rates_sum(lo,hi):
+        i=bisect.bisect_left(event_times,lo)
+        j=bisect.bisect_left(event_times,hi)
+        return prefix[j]-prefix[i],j-i
+    # First monthly UTC open with a complete 30-day historical signal and
+    # sufficient future room for ALL four horizons. Same entry across horizons.
+    anchors=[]
+    for t in sorted(set(spot)&set(perp)):
+        dt=datetime.fromtimestamp(t/1000,timezone.utc)
+        if dt.day!=1 or t<start_ms or t+45*DAY>end_ms:
+            continue
+        if t-30*DAY<warmup_ms:
+            continue
+        if any(t+h*DAY not in spot or t+h*DAY not in perp for h in (7,15,30,45)):
+            continue
+        prior7,n7=rates_sum(t-7*DAY,t)
+        prior30,n30=rates_sum(t-30*DAY,t)
+        if n7<14 or n30<60:
+            continue
+        anchors.append((t,prior7*100,prior30*100))
+    if not anchors:
+        raise HTTPException(503,detail="V1.5 için eşleşen aylık giriş tarihleri bulunamadı")
+    # Predeclared thresholds. Descriptive, NOT optimization or independent validation.
+    filters={
+        "all_monthly_entries":lambda a,b:True,
+        "prior_7d_positive":lambda a,b:a>0,
+        "prior_7d_at_least_0_05pct":lambda a,b:a>=0.05,
+        "prior_30d_at_least_0_30pct":lambda a,b:b>=0.30,
+        "both_7d_positive_and_30d_0_30pct":lambda a,b:a>0 and b>=0.30,
+    }
+    rows=[]
+    for t,prior7,prior30 in anchors:
+        s0,f0=spot[t],perp[t]
+        if min(s0,f0)<=0:
+            continue
+        for horizon in (7,15,30,45):
+            exit_t=t+horizon*DAY
+            s1,f1=spot[exit_t],perp[exit_t]
+            if min(s1,f1)<=0:
+                continue
+            # Cashflow proxy uses daily perp opens, NOT settlement-time mark.
+            i=bisect.bisect_right(event_times,t)
+            j=bisect.bisect_left(event_times,exit_t)
+            chosen=events[i:j]
+            missing=sum(1 for ts,_ in chosen if (ts//DAY)*DAY not in perp)
+            if missing:
+                raise HTTPException(503,detail="V1.5 funding için günlük fiyat eksik")
+            funding_proxy_pct=100*sum(r*perp[(ts//DAY)*DAY]/s0 for ts,r in chosen)
+            raw_sum_pct=100*sum(r for _,r in chosen)
+            basis_pct=100*((s1-s0)+(f0-f1))/s0
+            gross_pct=funding_proxy_pct+basis_pct
+            # 4 fills: spot buy+sell and perp short+cover; each fee is
+            # charged on actual corresponding notional, relative to spot entry.
+            fill_notional_ratio=1+s1/s0+f0/s0+f1/s0
+            exec_pct=(fee_per_fill_bps+slippage_per_fill_bps)/100*fill_notional_ratio
+            fin_pct=financing_annual_pct*horizon/365
+            rows.append({
+                "entry_utc":datetime.fromtimestamp(t/1000,timezone.utc).strftime("%Y-%m-%d"),
+                "entry_year":datetime.fromtimestamp(t/1000,timezone.utc).year,
+                "horizon_days":horizon,
+                "prior_7d_raw_rate_pct":round(prior7,6),
+                "prior_30d_raw_rate_pct":round(prior30,6),
+                "events":len(chosen),
+                "raw_rate_sum_pct":round(raw_sum_pct,6),
+                "funding_daily_open_proxy_pct":round(funding_proxy_pct,6),
+                "basis_pct":round(basis_pct,6),
+                "execution_cost_pct":round(exec_pct,6),
+                "financing_cost_pct":round(fin_pct,6),
+                "net_proxy_pct":round(gross_pct-exec_pct-fin_pct,6),
+                "settlement_mark_verified":False
+            })
+    comparisons=[]
+    for name,rule in filters.items():
+        for h in (7,15,30,45):
+            subset=[r for r in rows if r["horizon_days"]==h and
+                    rule(r["prior_7d_raw_rate_pct"],r["prior_30d_raw_rate_pct"])]
+            values=[r["net_proxy_pct"] for r in subset]
+            comparisons.append({
+                "filter":name,"horizon_days":h,"trades":len(values),
+                "mean_net_proxy_pct":round(statistics.mean(values),6) if values else None,
+                "median_net_proxy_pct":round(statistics.median(values),6) if values else None,
+                "win_rate_pct":round(100*sum(v>0 for v in values)/len(values),2) if values else None,
+                "worst_net_proxy_pct":round(min(values),6) if values else None,
+                "by_entry_year":[{
+                    "year":year,"trades":len(ys),
+                    "mean_net_proxy_pct":round(statistics.mean(ys),6)
+                } for year in sorted({r["entry_year"] for r in subset})
+                  for ys in [[r["net_proxy_pct"] for r in subset if r["entry_year"]==year]]]
+            })
+    # Exact matching of source windows: V1.4 compared different windows.
+    source_audit={
+        "dataset_window_start_utc":datetime.fromtimestamp(warmup_ms/1000,timezone.utc).isoformat(),
+        "dataset_window_end_utc":datetime.fromtimestamp(end_ms/1000,timezone.utc).isoformat(),
+        "funding_events_in_window":len(events),
+        "funding_intervals":len(events)-1,
+        "spot_daily_open_rows":len(spot),
+        "perp_daily_open_rows":len(perp),
+        "monthly_matched_entry_count":len(anchors),
+        "daily_open_prices_only":True,
+        "settlement_mark_price_source":"UNAVAILABLE_NOT_VERIFIED",
+        "funding_cashflow_reconciled":False
+    }
+    return {
+        "project":"CRYPTO-RESEARCH-V1","version":"1.5.0",
+        "model":"MATCHED_HORIZON_PAST_ONLY_FILTER_RESEARCH",
+        "paper_only":True,"trading":False,"orders":False,
+        "symbol":symbol,"days":days,
+        "inputs":{"fee_per_fill_bps":fee_per_fill_bps,
+                  "slippage_per_fill_bps":slippage_per_fill_bps,
+                  "financing_annual_pct":financing_annual_pct,
+                  "horizons_days":[7,15,30,45]},
+        "data_audit":source_audit,
+        "comparisons":comparisons,
+        "monthly_matched_entries":rows,
+        "limitations":[
+            "Settlement-time mark prices have not been retrieved or verified. Funding uses DAILY OPEN proxy.",
+            "Historical funding rate sums are not actual credited funding payments.",
+            "All horizons share monthly entry dates; results are correlated, not independent.",
+            "Monthly sampling reduces overlap but also yields very few observations.",
+            "Filter thresholds were chosen after prior history was inspected; no fresh out-of-sample evidence.",
+            "Missing future horizon near dataset end is excluded equally across horizons.",
+            "This model assumes equal base-asset quantities for spot and perp short.",
+            "Capital denominators are spot-entry notional, not full cash/margin collateral.",
+            "No borrowing availability, maintenance margin, liquidation, ADL, intraday basis risk.",
+            "Financing and execution fees are assumptions, not observed exchange charges.",
+            "This endpoint does not simulate orders and must not be used for live trading."
         ]
     }
