@@ -28,11 +28,11 @@ def check_symbol(symbol: str):
 
 @app.get("/")
 def root():
-    return {"project": "CRYPTO-RESEARCH-V1", "mode": "RESEARCH_PAPER_ONLY", "orders": False, "routes": ["/health", "/mr/signal", "/funding/latest", "/mr/backtest", "/mr/cost-analysis", "/funding/backtest", "/funding/carry-analysis", "/funding/carry-basis-analysis", "/funding/carry-backtest", "/funding/archive-status", "/docs"]}
+    return {"project": "CRYPTO-RESEARCH-V1", "mode": "RESEARCH_PAPER_ONLY", "orders": False, "routes": ["/health", "/mr/signal", "/funding/latest", "/mr/backtest", "/mr/cost-analysis", "/funding/backtest", "/funding/carry-analysis", "/funding/carry-basis-analysis", "/funding/carry-backtest", "/funding/archive-status", "/funding/reversal-risk", "/docs"]}
 
 @app.get("/health")
 def health():
-    return {"status": "OK", "utc": datetime.now(timezone.utc).isoformat(), "paper_only": True, "trading": False, "orders": False, "version": "0.7.1"}
+    return {"status": "OK", "utc": datetime.now(timezone.utc).isoformat(), "paper_only": True, "trading": False, "orders": False, "version": "0.8.0"}
 
 @app.get("/mr/signal")
 async def mr_signal(symbol: str = Query("BTCUSDT"), interval: Literal["5m", "15m", "1h"] = "15m"):
@@ -256,7 +256,7 @@ async def mr_cost_analysis(
                 "max_closed_trade_drawdown_pct": r["summary"]["max_closed_trade_drawdown_pct"],
             })
     return {
-        "project": "CRYPTO-RESEARCH-V1", "version": "0.7.1",
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.8.0",
         "symbol": symbol, "interval": interval, "days": days,
         "data_bars": len(raw), "paper_only": True, "orders": False,
         "scenarios": results,
@@ -531,7 +531,7 @@ async def funding_carry_analysis(
             "latest_funding_minus_cost_pct": round_or_none(latest[1] - assumed_round_trip_cost_pct) if latest else None,
         })
     return {
-        "project": "CRYPTO-RESEARCH-V1", "version": "0.7.1",
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.8.0",
         "model": "FA_B_FUNDING_PERSISTENCE_DIAGNOSTIC",
         "symbol": symbol, "days": days, "paper_only": True, "orders": False,
         "period_funding_events": len(in_period),
@@ -686,7 +686,7 @@ async def funding_carry_basis_analysis(
         })
     return {
         "project": "CRYPTO-RESEARCH-V1",
-        "version": "0.7.1",
+        "version": "0.8.0",
         "model": "FA_B_RETROSPECTIVE_CARRY_BASIS",
         "symbol": symbol,
         "days": days,
@@ -827,7 +827,7 @@ async def funding_archive_status(symbol: Literal['BTCUSDT', 'ETHUSDT', 'SOLUSDT'
         for kind in ('spot', 'perp', 'funding'):
             part = await _archive_fetch(client, symbol, month, kind)
             data[kind] = {'rows': len(part), 'min_timestamp_ms': min(part) if part else None, 'max_timestamp_ms': max(part) if part else None}
-    return {'project': 'CRYPTO-RESEARCH-V1', 'version': '0.7.1', 'source': 'Binance Vision', 'month': month, 'symbol': symbol, 'datasets': data, 'paper_only': True, 'orders': False}
+    return {'project': 'CRYPTO-RESEARCH-V1', 'version': '0.8.0', 'source': 'Binance Vision', 'month': month, 'symbol': symbol, 'datasets': data, 'paper_only': True, 'orders': False}
 
 @app.get("/funding/carry-backtest")
 async def funding_carry_backtest(
@@ -943,7 +943,7 @@ async def funding_carry_backtest(
             "trades": [{k: v for k, v in t.items() if not k.startswith("_")} for t in trades],
         })
     return {
-        "project": "CRYPTO-RESEARCH-V1", "version": "0.7.1",
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.8.0",
         "model": "FA_B_CHRONOLOGICAL_PAPER_BACKTEST",
         "symbol": symbol, "days": days,
         "lookback_days": lookback_days,
@@ -960,5 +960,109 @@ async def funding_carry_backtest(
             "Returns normalized to spot entry notional, not total capital; compounding is illustrative.",
             "Funding is realized after entry; not known in advance. No live orders or profitability guarantee.",
             "Only completed monthly archives are used, so results end at the prior month.",
+        ],
+    }
+
+
+# V0.8: diagnostic only. No rule optimization, new trades, or live orders.
+@app.get("/funding/reversal-risk")
+async def funding_reversal_risk(
+    symbol: Literal["BTCUSDT", "ETHUSDT", "SOLUSDT"] = "BTCUSDT",
+    days: int = Query(180, ge=120, le=180),
+    lookback_days: int = Query(7, ge=3, le=14),
+    min_past_funding_pct: float = Query(0.05, ge=0, le=1),
+):
+    from bisect import bisect_left, bisect_right
+    DAY, HOUR = 86_400_000, 3_600_000
+    today = datetime.now(timezone.utc)
+    end = int(datetime(today.year, today.month, 1, tzinfo=timezone.utc).timestamp()*1000) - DAY
+    start = end - days*DAY
+    warmup = start - (lookback_days+2)*DAY
+    spot, perp, events = await _archive_bundle(symbol, warmup, end)
+    times = [t for t, _ in events]
+    if len(events) < days or len(spot.keys() & perp.keys()) < days*.9:
+        raise HTTPException(503, "Yeterli arşiv verisi bulunamadı")
+    base = await funding_carry_backtest(symbol=symbol, days=days,
+                                        lookback_days=lookback_days,
+                                        min_past_funding_pct=min_past_funding_pct)
+    diagnostics = []
+    for group in base["results"]:
+        for trade in group["trades"]:
+            entry = int(datetime.fromisoformat(trade["entry_utc"]).timestamp()*1000)
+            exit_t = int(datetime.fromisoformat(trade["exit_utc"]).timestamp()*1000)
+            s0, f0 = spot[entry], perp[entry]
+            inside = events[bisect_right(times, entry):bisect_right(times, exit_t)]
+            daily_path = []
+            running_funding = 0.0
+            index = 0
+            negative_events = sum(rate < 0 for _, rate in inside)
+            negative_days = 0
+            first_negative_day = None
+            worst_daily_funding_pct = None
+            for day in range(entry+DAY, exit_t+DAY, DAY):
+                day_funding = 0.0
+                while index < len(inside) and inside[index][0] <= day:
+                    t, rate = inside[index]
+                    daily_open = (t//DAY)*DAY
+                    if daily_open in perp:
+                        amount = 100*rate*perp[daily_open]/s0
+                        running_funding += amount
+                        day_funding += amount
+                    index += 1
+                if day not in spot or day not in perp:
+                    continue
+                if day_funding < 0:
+                    negative_days += 1
+                    if first_negative_day is None:
+                        first_negative_day = (day-entry)//DAY
+                worst_daily_funding_pct = (day_funding if worst_daily_funding_pct is None
+                                           else min(worst_daily_funding_pct, day_funding))
+                basis = 100*((spot[day]-s0)+(f0-perp[day]))/s0
+                gross = running_funding + basis
+                daily_path.append((day, gross))
+            if not daily_path:
+                continue
+            peak = 0.0
+            max_peak_to_trough = 0.0
+            for _, gross in daily_path:
+                peak = max(peak, gross)
+                max_peak_to_trough = max(max_peak_to_trough, peak-gross)
+            min_gross = min(v for _, v in daily_path)
+            diagnostics.append({
+                "hold_days": group["hold_days"],
+                "entry_utc": trade["entry_utc"],
+                "partition": trade["partition"],
+                "negative_funding_events": negative_events,
+                "negative_funding_days": negative_days,
+                "first_negative_funding_day": first_negative_day,
+                "worst_daily_funding_pct": round(worst_daily_funding_pct, 6) if worst_daily_funding_pct is not None else None,
+                "min_daily_mark_gross_pct": round(min_gross, 6),
+                "max_daily_peak_to_trough_pct_points": round(max_peak_to_trough, 6),
+                "final_gross_pct": trade["gross_pct"],
+            })
+    groups = []
+    for hold in (30,45):
+        subset = [r for r in diagnostics if r["hold_days"] == hold]
+        groups.append({
+            "hold_days": hold, "trades": len(subset),
+            "trades_with_negative_funding_event": sum(r["negative_funding_events"]>0 for r in subset),
+            "trades_with_negative_funding_day": sum(r["negative_funding_days"]>0 for r in subset),
+            "mean_negative_funding_days": round(sum(r["negative_funding_days"] for r in subset)/len(subset),3) if subset else None,
+            "worst_observed_daily_mark_gross_pct": min((r["min_daily_mark_gross_pct"] for r in subset), default=None),
+            "largest_daily_peak_to_trough_pct_points": max((r["max_daily_peak_to_trough_pct_points"] for r in subset), default=None),
+        })
+    return {
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.8.0",
+        "model": "FA_B_FUNDING_REVERSAL_RISK_DIAGNOSTIC",
+        "paper_only": True, "orders": False, "symbol": symbol, "days": days,
+        "source": "Binance Vision completed monthly archives",
+        "groups": groups, "trade_diagnostics": diagnostics,
+        "limitations": [
+            "Uses V0.7.1 chronological entry rules; no new entry/exit strategy is tested.",
+            "Negative funding day is defined by net daily funding sum, not every individual event.",
+            "Daily marks are synthetic spot-long/perp-short PnL, not executable liquidation values.",
+            "Daily prices miss intraday stress; funding uses daily perp-open notional approximation.",
+            "No margin, liquidation, collateral, financing, spreads or slippage risk model.",
+            "Tiny sample; descriptive diagnostics only, no reliable forecast or proven edge.",
         ],
     }
