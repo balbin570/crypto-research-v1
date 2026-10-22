@@ -7,7 +7,7 @@ from typing import Literal
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="CRYPTO-RESEARCH-V1", version="0.2.0")
+app = FastAPI(title="CRYPTO-RESEARCH-V1", version="0.3.0")
 SPOT = "https://data-api.binance.vision"
 FUTURES = "https://fapi.binance.com"
 SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
@@ -28,11 +28,11 @@ def check_symbol(symbol: str):
 
 @app.get("/")
 def root():
-    return {"project": "CRYPTO-RESEARCH-V1", "mode": "RESEARCH_PAPER_ONLY", "orders": False, "routes": ["/health", "/mr/signal", "/funding/latest", "/mr/backtest", "/docs"]}
+    return {"project": "CRYPTO-RESEARCH-V1", "mode": "RESEARCH_PAPER_ONLY", "orders": False, "routes": ["/health", "/mr/signal", "/funding/latest", "/mr/backtest", "/mr/cost-analysis", "/docs"]}
 
 @app.get("/health")
 def health():
-    return {"status": "OK", "utc": datetime.now(timezone.utc).isoformat(), "paper_only": True, "trading": False, "orders": False, "version": "0.2.0"}
+    return {"status": "OK", "utc": datetime.now(timezone.utc).isoformat(), "paper_only": True, "trading": False, "orders": False, "version": "0.3.0"}
 
 @app.get("/mr/signal")
 async def mr_signal(symbol: str = Query("BTCUSDT"), interval: Literal["5m", "15m", "1h"] = "15m"):
@@ -133,6 +133,10 @@ async def mr_backtest(
     slippage_bps: float = Query(2.0, ge=0, le=100),
 ):
     raw = await historical_candles(symbol, interval, days)
+    return run_mr_simulation(raw, symbol, interval, days, variant, fee_bps, slippage_bps)
+
+
+def run_mr_simulation(raw, symbol, interval, days, variant, fee_bps, slippage_bps):
     if len(raw) < 100:
         raise HTTPException(status_code=503, detail="Backtest için yeterli geçmiş mum alınamadı")
     opens = [float(x[1]) for x in raw]
@@ -222,3 +226,46 @@ async def mr_backtest(
                        "profit_factor":round(pf,4) if isinstance(pf,float) else pf,
                        "max_closed_trade_drawdown_pct":round(max_dd,4)},
             "last_10_trades":trades[-10:]}
+
+
+@app.get("/mr/cost-analysis")
+async def mr_cost_analysis(
+    symbol: Literal["BTCUSDT", "ETHUSDT", "SOLUSDT"] = "BTCUSDT",
+    interval: Literal["5m", "15m", "1h"] = "15m",
+    days: int = Query(30, ge=7, le=180),
+):
+    """Same historical bars for all six scenarios; research only."""
+    raw = await historical_candles(symbol, interval, days)
+    scenarios = [
+        ("zero_cost", 0.0, 0.0),
+        ("low_cost", 4.0, 1.0),
+        ("baseline_cost", 10.0, 2.0),
+    ]
+    results = []
+    for variant in ("A", "B"):
+        for label, fee, slip in scenarios:
+            r = run_mr_simulation(raw, symbol, interval, days, variant, fee, slip)
+            results.append({
+                "model": r["model"], "scenario": label,
+                "round_trip_cost_bps": 2 * (fee + slip),
+                "trades": r["summary"]["trades"],
+                "win_rate_pct": r["summary"]["win_rate_pct"],
+                "mean_net_pct": r["summary"]["mean_net_pct"],
+                "compounded_return_pct": r["summary"]["compounded_return_pct"],
+                "profit_factor": r["summary"]["profit_factor"],
+                "max_closed_trade_drawdown_pct": r["summary"]["max_closed_trade_drawdown_pct"],
+            })
+    return {
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.3.0",
+        "symbol": symbol, "interval": interval, "days": days,
+        "data_bars": len(raw), "paper_only": True, "orders": False,
+        "scenarios": results,
+        "limitations": [
+            "Each cost scenario reruns the same entry/exit logic on the same historical bars.",
+            "Execution is OHLC-based and not a tick-level fill simulation.",
+            "Stop/target levels are based on raw entry and do not guarantee positive net TARGET trades.",
+            "Signals can be generated on a bar where a previous trade exits; only one position at a time.",
+            "Max drawdown is computed from closed-trade equity, not intratrade equity.",
+            "Research results are not evidence of future profitability."
+        ]
+    }
