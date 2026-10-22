@@ -7,7 +7,7 @@ from typing import Literal
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="CRYPTO-RESEARCH-V1", version="2.1.0")
+app = FastAPI(title="CRYPTO-RESEARCH-V1", version="2.3.0")
 SPOT = "https://data-api.binance.vision"
 FUTURES = "https://fapi.binance.com"
 SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
@@ -2705,4 +2705,63 @@ async def funding_v22_holding_period_research(
             "Strategies are inspected on the same historical data; not out-of-sample.",
             "Intraday margin, liquidation, ADL, and order-book liquidity not modeled.",
             "Summed PnL is not CAGR or an executable portfolio return.",
+            "PAPER ONLY; NO ORDERS."]}
+
+
+@app.get("/funding/v23-mark-data-audit")
+async def funding_v23_mark_data_audit(
+    symbol: Literal["BTCUSDT","ETHUSDT","SOLUSDT"]="BTCUSDT",
+    month: str=Query("2026-08",pattern=r"^20[0-9]{2}-(0[1-9]|1[0-2])$"),
+):
+    """Public archive mark-price coverage audit, not settlement verification."""
+    import io,zipfile,csv,calendar,bisect
+    from datetime import datetime,timezone
+    y,m=map(int,month.split("-"))
+    if (y,m)>(datetime.now(timezone.utc).year,datetime.now(timezone.utc).month-1):
+        raise HTTPException(400,detail="Yalnızca tamamlanmış geçmiş aylar")
+    url=f"{_ARCHIVE_ROOT}/futures/um/monthly/markPriceKlines/{symbol}/1h/{symbol}-1h-{month}.zip"
+    async with httpx.AsyncClient(timeout=50,follow_redirects=True) as client:
+        funding=await _archive_fetch(client,symbol,month,"funding")
+        try:
+            response=await client.get(url)
+            response.raise_for_status()
+            with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+                names=[n for n in z.namelist() if n.endswith(".csv")]
+                if len(names)!=1:raise ValueError("CSV count invalid")
+                with z.open(names[0]) as f:
+                    reader=csv.reader(io.TextIOWrapper(f,encoding="utf-8-sig"))
+                    marks={}
+                    for row in reader:
+                        if len(row)<5:continue
+                        try:
+                            t=_archive_timestamp(row[0]); close=float(row[4])
+                            if close>0:marks[t]=close
+                        except (ValueError,TypeError):continue
+        except (httpx.HTTPError,ValueError,zipfile.BadZipFile) as exc:
+            return {"version":"2.3.0","symbol":symbol,"month":month,
+                "status":"MARK_ARCHIVE_UNAVAILABLE","mark_archive_url":url,
+                "error_type":type(exc).__name__,"funding_events":len(funding),
+                "paper_only":True,"orders":False}
+    # Hourly candle OPEN is not the funding settlement mark. No false verification.
+    times=sorted(marks)
+    matched=[]
+    missing=[]
+    for ts,rate in sorted(funding.items()):
+        # A mark candle at the same hour is only an hourly proxy.
+        hour=(ts//3600000)*3600000
+        if hour in marks:
+            matched.append({"funding_time_utc":datetime.fromtimestamp(ts/1000,timezone.utc).isoformat(),
+                            "funding_rate":rate,"hourly_mark_open_proxy":marks[hour]})
+        else:missing.append(ts)
+    return {"project":"CRYPTO-RESEARCH-V1","version":"2.3.0",
+        "symbol":symbol,"month":month,"paper_only":True,"orders":False,
+        "status":"HOURLY_MARK_PROXY_ONLY_NOT_SETTLEMENT_VERIFIED",
+        "source_url":url,"mark_1h_candles":len(marks),
+        "funding_events":len(funding),"hourly_mark_proxy_matches":len(matched),
+        "missing_matches":len(missing),"sample_matches":matched[:5],
+        "limitations":[
+            "Hourly mark-price candle open is NOT the precise settlement mark price.",
+            "This endpoint checks public archive coverage; it does not recompute strategy P&L.",
+            "No actual short position quantities or exchange account funding ledger.",
+            "No authenticated credentials needed; do not share API keys.",
             "PAPER ONLY; NO ORDERS."]}
