@@ -2956,3 +2956,104 @@ async def funding_v25_multistage_research(
         "Strategy ranking reuses historical observations; no out-of-sample proof.",
         "Summed trade PnL is not portfolio CAGR.",
         "PAPER ONLY; NO ORDERS."]}
+
+
+# V2.6: independent, bounded 2026 45-day hourly-mark funding proxy audit.
+@app.get("/funding/v26-45d-mark-research")
+async def funding_v26_45d_mark_research(
+    symbol: Literal["BTCUSDT","ETHUSDT","SOLUSDT"]="BTCUSDT",
+    year: int=Query(2026,ge=2024,le=2026),
+    fee_per_fill_bps: float=Query(10,ge=0,le=50),
+    slippage_per_fill_bps: float=Query(2,ge=0,le=50),
+    spot_notional_usdt: float=Query(1000,gt=0,le=100000),
+    annual_opportunity_cost_pct: float=Query(0,ge=0,le=30),
+):
+    """45-day fixed-quantity spot/short model, hourly mark proxy, completed archives."""
+    import csv,io,zipfile,bisect,statistics
+    from datetime import datetime,timezone
+    DAY=86400000; HOUR=3600000
+    now=datetime.now(timezone.utc)
+    first_this_month=datetime(now.year,now.month,1,tzinfo=timezone.utc)
+    archive_end=int(first_this_month.timestamp()*1000)-DAY
+    start=int(datetime(year,1,1,tzinfo=timezone.utc).timestamp()*1000)
+    end=min(archive_end,int(datetime(year+1,1,1,tzinfo=timezone.utc).timestamp()*1000)-DAY)
+    if end<start+75*DAY:raise HTTPException(400,detail="Yeterli tamamlanmış arşiv yok")
+    # Includes 30-day prior signal and 45-day exit for each eligible monthly entry.
+    warmup=start-32*DAY
+    spot,perp,events=await _archive_bundle(symbol,warmup,end)
+    months=_archive_months(warmup,end)
+    marks={}
+    async with httpx.AsyncClient(timeout=60,follow_redirects=True) as client:
+        for month in months:
+            url=f"{_ARCHIVE_ROOT}/futures/um/monthly/markPriceKlines/{symbol}/1h/{symbol}-1h-{month}.zip"
+            try:
+                r=await client.get(url);r.raise_for_status()
+                with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                    names=[n for n in z.namelist() if n.lower().endswith('.csv')]
+                    if len(names)!=1:raise ValueError('CSV count')
+                    with z.open(names[0]) as f:
+                        for row in csv.reader(io.TextIOWrapper(f,encoding='utf-8-sig')):
+                            if len(row)<5:continue
+                            try:
+                                t=_archive_timestamp(row[0]);v=float(row[1])
+                                if v>0:marks[t]=v
+                            except (ValueError,TypeError):continue
+            except (httpx.HTTPError,zipfile.BadZipFile,ValueError) as exc:
+                raise HTTPException(503,detail={"error":"mark archive unavailable","month":month,
+                                                "exception":type(exc).__name__}) from exc
+    times=[t for t,_ in events]
+    rows=[]; skipped=[]
+    for t in sorted(set(spot)&set(perp)):
+        dt=datetime.fromtimestamp(t/1000,timezone.utc)
+        if dt.year!=year or dt.day!=1 or t+45*DAY>end:continue
+        x=t+45*DAY
+        if x not in spot or x not in perp:continue
+        i=bisect.bisect_left(times,t-7*DAY);j=bisect.bisect_left(times,t)
+        k=bisect.bisect_right(times,t);l=bisect.bisect_left(times,x)
+        if j-i<14:continue
+        prior=sum(rate for _,rate in events[i:j]);selected=prior>0
+        s0,s1=spot[t],spot[x];p0,p1=perp[t],perp[x]
+        if min(s0,s1,p0,p1)<=0:continue
+        quantity=spot_notional_usdt/s0
+        paired=[];missing=[]
+        for ts,rate in events[k:l]:
+            hour=ts//HOUR*HOUR
+            if hour in marks:paired.append((ts,rate,marks[hour]))
+            else:missing.append(ts)
+        if missing:
+            skipped.append({"entry":dt.strftime('%Y-%m-%d'),"missing_mark_events":len(missing)})
+            continue
+        funding=sum(quantity*mark*rate for _,rate,mark in paired)
+        spot_pnl=quantity*(s1-s0)
+        short_pnl=quantity*(p0-p1)
+        cost=(fee_per_fill_bps+slippage_per_fill_bps)/10000*quantity*(s0+s1+p0+p1)
+        capital=2*spot_notional_usdt
+        opportunity=capital*annual_opportunity_cost_pct/100*45/365
+        net=funding+spot_pnl+short_pnl-cost-opportunity
+        rows.append({"entry":dt.strftime('%Y-%m-%d'),"exit":datetime.fromtimestamp(x/1000,timezone.utc).strftime('%Y-%m-%d'),
+                     "prior_7d_positive":selected,"funding_events":len(paired),
+                     "funding_proxy_usdt":round(funding,5),"spot_pnl_usdt":round(spot_pnl,5),
+                     "perp_short_pnl_usdt":round(short_pnl,5),"execution_cost_usdt":round(cost,5),
+                     "opportunity_cost_usdt":round(opportunity,5),"net_proxy_usdt":round(net,5)})
+    def summary(items):
+        if not items:return {"trades":0}
+        return {"trades":len(items),"positive_trades":sum(r['net_proxy_usdt']>0 for r in items),
+                "sum_net_proxy_usdt":round(sum(r['net_proxy_usdt'] for r in items),5),
+                "mean_net_proxy_usdt":round(statistics.mean(r['net_proxy_usdt'] for r in items),5),
+                "sum_funding_proxy_usdt":round(sum(r['funding_proxy_usdt'] for r in items),5),
+                "sum_execution_cost_usdt":round(sum(r['execution_cost_usdt'] for r in items),5)}
+    return {"project":"CRYPTO-RESEARCH-V1","version":"2.6.0","paper_only":True,"orders":False,
+            "symbol":symbol,"entry_year":year,"hold_days":45,"mark_proxy":"funding-hour 1h mark candle OPEN",
+            "short_coin_quantity":"equal to spot coin quantity at entry (fixed)",
+            "spot_notional_usdt":spot_notional_usdt,"assumed_capital_usdt":2*spot_notional_usdt,
+            "data":{"funding_events":len(events),"mark_hourly_rows":len(marks),"months_loaded":len(months),
+                    "skipped_entries":skipped},
+            "all_monthly":summary(rows),"prior_7d_positive":summary([r for r in rows if r['prior_7d_positive']]),
+            "trades":rows,
+            "limitations":["Hourly mark OPEN is not verified funding settlement mark.",
+                           "Spot and perp entry/exit use daily OPEN, not executable bid/ask fills.",
+                           "Funding rate and hourly mark are archive proxies, not actual account ledger.",
+                           "No intraday margin liquidation, ADL, borrow rates, funding transfers or financing modeled.",
+                           "Positions can overlap; summed trade net is not portfolio CAGR.",
+                           "Same historical periods have already been inspected; not out-of-sample.",
+                           "PAPER ONLY; NO ORDERS."]}
