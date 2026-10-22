@@ -32,7 +32,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "OK", "utc": datetime.now(timezone.utc).isoformat(), "paper_only": True, "trading": False, "orders": False, "version": "0.6.0"}
+    return {"status": "OK", "utc": datetime.now(timezone.utc).isoformat(), "paper_only": True, "trading": False, "orders": False, "version": "0.6.1"}
 
 @app.get("/mr/signal")
 async def mr_signal(symbol: str = Query("BTCUSDT"), interval: Literal["5m", "15m", "1h"] = "15m"):
@@ -256,7 +256,7 @@ async def mr_cost_analysis(
                 "max_closed_trade_drawdown_pct": r["summary"]["max_closed_trade_drawdown_pct"],
             })
     return {
-        "project": "CRYPTO-RESEARCH-V1", "version": "0.6.0",
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.6.1",
         "symbol": symbol, "interval": interval, "days": days,
         "data_bars": len(raw), "paper_only": True, "orders": False,
         "scenarios": results,
@@ -305,7 +305,9 @@ async def _hourly_history(base: str, symbol: str, start_ms: int, end_ms: int, pa
                 r.raise_for_status()
                 batch = r.json()
             except (httpx.HTTPError, ValueError) as exc:
-                raise HTTPException(502, f"Saatlik fiyat geçmişi alınamadı: {type(exc).__name__}") from exc
+                status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+                source = "SPOT" if base == SPOT else "FUTURES" if base == FUTURES else "UNKNOWN"
+                raise HTTPException(502, detail={"error": "Saatlik fiyat geçmişi alınamadı", "source": source, "upstream_http_status": status, "exception": type(exc).__name__, "hint": "403/451: bölgesel erişim; 429: hız sınırı; 400: istek parametresi"}) from exc
             if not isinstance(batch, list) or not batch:
                 break
             for row in batch:
@@ -450,7 +452,7 @@ async def funding_backtest(
     }
 
 # Ensure the old routes remain unchanged. Version is informational only.
-app.version = '0.6.0'
+app.version = '0.6.1'
 
 
 # V0.5: Funding carry diagnostics, strictly descriptive and research-only.
@@ -529,7 +531,7 @@ async def funding_carry_analysis(
             "latest_funding_minus_cost_pct": round_or_none(latest[1] - assumed_round_trip_cost_pct) if latest else None,
         })
     return {
-        "project": "CRYPTO-RESEARCH-V1", "version": "0.6.0",
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.6.1",
         "model": "FA_B_FUNDING_PERSISTENCE_DIAGNOSTIC",
         "symbol": symbol, "days": days, "paper_only": True, "orders": False,
         "period_funding_events": len(in_period),
@@ -660,7 +662,7 @@ async def funding_carry_basis_analysis(
         })
     return {
         "project": "CRYPTO-RESEARCH-V1",
-        "version": "0.6.0",
+        "version": "0.6.1",
         "model": "FA_B_RETROSPECTIVE_CARRY_BASIS",
         "symbol": symbol,
         "days": days,
