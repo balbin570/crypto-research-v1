@@ -3057,3 +3057,100 @@ async def funding_v26_45d_mark_research(
                            "Positions can overlap; summed trade net is not portfolio CAGR.",
                            "Same historical periods have already been inspected; not out-of-sample.",
                            "PAPER ONLY; NO ORDERS."]}
+
+
+# V2.7 combined audit: funding lookback signals, cost stress and overlapping-capital audit.
+# All scenarios reuse the same V2.6 hourly-mark dataset; no new execution or order capability.
+@app.get("/funding/v27-combined-robustness")
+async def funding_v27_combined_robustness(
+    symbol: Literal["BTCUSDT","ETHUSDT","SOLUSDT"]="BTCUSDT",
+    year: int=Query(2026,ge=2024,le=2026),
+    spot_notional_usdt: float=Query(1000,gt=0,le=100000),
+    capital_per_position_usdt: float=Query(2000,gt=0,le=1000000),
+    max_concurrent_positions: int=Query(1,ge=1,le=12),
+    annual_opportunity_cost_pct: float=Query(0,ge=0,le=30),
+):
+    """Single-run cost, entry-filter and overlapping-position robustness audit."""
+    from datetime import datetime,timezone
+    from bisect import bisect_left
+    from collections import defaultdict
+    from statistics import mean
+    # Baseline uses 10 bps fee + 2 bps slippage per fill; V2.6 records each fill's changing notional.
+    base=await funding_v26_45d_mark_research(
+        symbol=symbol,year=year,fee_per_fill_bps=10,slippage_per_fill_bps=2,
+        spot_notional_usdt=spot_notional_usdt,annual_opportunity_cost_pct=0)
+    trades=base['trades']
+    if not trades:
+        return {'project':'CRYPTO-RESEARCH-V1','version':'2.7.0','paper_only':True,
+                'orders':False,'status':'NO_COMPLETE_TRADES','data':base['data']}
+    DAY=86400000
+    first=min(int(datetime.fromisoformat(r['entry']).replace(tzinfo=timezone.utc).timestamp()*1000) for r in trades)
+    last=max(int(datetime.fromisoformat(r['exit']).replace(tzinfo=timezone.utc).timestamp()*1000) for r in trades)
+    _,_,events=await _archive_bundle(symbol,first-32*DAY,last)
+    event_times=[x[0] for x in events]
+    enriched=[]
+    for r in trades:
+        t=int(datetime.fromisoformat(r['entry']).replace(tzinfo=timezone.utc).timestamp()*1000)
+        windows={}
+        for d in (7,14,30):
+            a=bisect_left(event_times,t-d*DAY);b=bisect_left(event_times,t)
+            windows[d]={'funding_rate_sum':round(sum(rate for _,rate in events[a:b]),9),
+                        'observations':b-a,'positive':b-a>=d*2 and sum(rate for _,rate in events[a:b])>0}
+        enriched.append({**r,'prior_funding_windows':windows})
+    filters={
+        'ALL_MONTHLY':lambda r:True,
+        'PRIOR_7D_POSITIVE':lambda r:r['prior_funding_windows'][7]['positive'],
+        'PRIOR_14D_POSITIVE':lambda r:r['prior_funding_windows'][14]['positive'],
+        'PRIOR_30D_POSITIVE':lambda r:r['prior_funding_windows'][30]['positive'],
+        'PRIOR_7D_AND_30D_POSITIVE':lambda r:r['prior_funding_windows'][7]['positive'] and r['prior_funding_windows'][30]['positive'],
+    }
+    costs={'LOW':(2,1),'BASE':(10,2),'HIGH':(15,5)}
+    scenario_rows=[]
+    for filt,predicate in filters.items():
+        selected=[r for r in enriched if predicate(r)]
+        for case,(fee,slip) in costs.items():
+            # Recover unrounded reference 12-bps notional, then reprice the same four fills.
+            def pnl(r):
+                new_cost=r['execution_cost_usdt']*(fee+slip)/12
+                opp=capital_per_position_usdt*annual_opportunity_cost_pct/100*45/365
+                return r['funding_proxy_usdt']+r['spot_pnl_usdt']+r['perp_short_pnl_usdt']-new_cost-opp
+            values=[pnl(r) for r in selected]
+            scenario_rows.append({'filter':filt,'cost_case':case,'fee_bps_per_fill':fee,
+                'slippage_bps_per_fill':slip,'trades':len(values),
+                'positive_trades':sum(x>0 for x in values),
+                'net_total_usdt':round(sum(values),5),
+                'net_mean_per_trade_usdt':round(mean(values),5) if values else None,
+                'net_mean_pct_of_assumed_capital':round(100*mean(values)/capital_per_position_usdt,6) if values else None})
+    # Deterministic first-come portfolio scheduling. No portfolio compounding assumed.
+    portfolio=[]
+    for filt in filters:
+        selected=sorted((r for r in enriched if filters[filt](r)),key=lambda x:x['entry'])
+        open_exits=[]; accepted=[]; blocked=[]
+        for r in selected:
+            open_exits=[x for x in open_exits if x>r['entry']]
+            if len(open_exits)>=max_concurrent_positions:
+                blocked.append(r['entry']);continue
+            open_exits.append(r['exit']);accepted.append(r)
+        def baseline_net(r):
+            return r['funding_proxy_usdt']+r['spot_pnl_usdt']+r['perp_short_pnl_usdt']-r['execution_cost_usdt']-capital_per_position_usdt*annual_opportunity_cost_pct/100*45/365
+        portfolio.append({'filter':filt,'max_concurrent_positions':max_concurrent_positions,
+          'accepted_trades':len(accepted),'blocked_overlaps':blocked,
+          'net_total_base_cost_usdt':round(sum(baseline_net(r) for r in accepted),5),
+          'assumed_capital_ceiling_usdt':capital_per_position_usdt*max_concurrent_positions,
+          'not_a_portfolio_CAGR':True})
+    return {'project':'CRYPTO-RESEARCH-V1','version':'2.7.0','paper_only':True,
+      'trading':False,'orders':False,'symbol':symbol,'entry_year':year,'hold_days':45,
+      'status':'COMBINED_RESEARCH_PROXY_NOT_VERIFIED_PNL',
+      'data_audit':base['data'],'capital_assumptions':{'capital_per_position_usdt':capital_per_position_usdt,
+          'max_concurrent_positions':max_concurrent_positions,'annual_opportunity_cost_pct':annual_opportunity_cost_pct},
+      'cost_and_entry_filter_scenarios':scenario_rows,'overlap_constrained_portfolios':portfolio,
+      'baseline_trades_with_prior_windows':enriched,
+      'critical_limitations':[
+        'The 2026 sample is small and June was skipped for missing mark data.',
+        'Hourly mark OPEN is a proxy, not actual funding settlement price.',
+        'Daily spot and perp OPEN are not executable bid/ask fills.',
+        'Lookback filters use only past funding; same historical sample was already inspected.',
+        'LOW/BASE/HIGH costs are hypothetical; actual exchange fee tier and spread are unverified.',
+        'Portfolio uses first-come entries with static assumed capital; no intraday liquidation or margin path.',
+        'No dynamic early exits, borrowing costs, ledger reconciliation, CAGR or forward validation.',
+        'PAPER ONLY; NO ORDERS.' ]}
