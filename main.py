@@ -7,7 +7,7 @@ from typing import Literal
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="CRYPTO-RESEARCH-V1", version="0.3.0")
+app = FastAPI(title="CRYPTO-RESEARCH-V1", version="0.4.0")
 SPOT = "https://data-api.binance.vision"
 FUTURES = "https://fapi.binance.com"
 SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
@@ -28,11 +28,11 @@ def check_symbol(symbol: str):
 
 @app.get("/")
 def root():
-    return {"project": "CRYPTO-RESEARCH-V1", "mode": "RESEARCH_PAPER_ONLY", "orders": False, "routes": ["/health", "/mr/signal", "/funding/latest", "/mr/backtest", "/mr/cost-analysis", "/docs"]}
+    return {"project": "CRYPTO-RESEARCH-V1", "mode": "RESEARCH_PAPER_ONLY", "orders": False, "routes": ["/health", "/mr/signal", "/funding/latest", "/mr/backtest", "/mr/cost-analysis", "/funding/backtest", "/docs"]}
 
 @app.get("/health")
 def health():
-    return {"status": "OK", "utc": datetime.now(timezone.utc).isoformat(), "paper_only": True, "trading": False, "orders": False, "version": "0.3.0"}
+    return {"status": "OK", "utc": datetime.now(timezone.utc).isoformat(), "paper_only": True, "trading": False, "orders": False, "version": "0.4.0"}
 
 @app.get("/mr/signal")
 async def mr_signal(symbol: str = Query("BTCUSDT"), interval: Literal["5m", "15m", "1h"] = "15m"):
@@ -256,7 +256,7 @@ async def mr_cost_analysis(
                 "max_closed_trade_drawdown_pct": r["summary"]["max_closed_trade_drawdown_pct"],
             })
     return {
-        "project": "CRYPTO-RESEARCH-V1", "version": "0.3.0",
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.4.0",
         "symbol": symbol, "interval": interval, "days": days,
         "data_bars": len(raw), "paper_only": True, "orders": False,
         "scenarios": results,
@@ -269,3 +269,185 @@ async def mr_cost_analysis(
             "Research results are not evidence of future profitability."
         ]
     }
+
+# V0.4: historical, read-only cash-and-carry research.
+# The strategy uses ONLY funding events already observed before each entry.
+async def _funding_history(symbol: str, start_ms: int, end_ms: int):
+    out = []
+    cursor = start_ms
+    async with httpx.AsyncClient(timeout=25) as client:
+        while cursor <= end_ms:
+            try:
+                r = await client.get(f"{FUTURES}/fapi/v1/fundingRate", params={"symbol": symbol, "startTime": cursor, "endTime": end_ms, "limit": 1000})
+                r.raise_for_status()
+                batch = r.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                raise HTTPException(502, f"Funding geçmişi alınamadı: {type(exc).__name__}") from exc
+            if not isinstance(batch, list) or not batch:
+                break
+            out.extend(batch)
+            nxt = int(batch[-1]["fundingTime"]) + 1
+            if nxt <= cursor:
+                break
+            cursor = nxt
+            if len(batch) < 1000:
+                break
+    return sorted({int(x["fundingTime"]): (int(x["fundingTime"]), float(x["fundingRate"])) for x in out}.values())
+
+
+async def _hourly_history(base: str, symbol: str, start_ms: int, end_ms: int, path: str):
+    out = {}
+    cursor = start_ms
+    async with httpx.AsyncClient(timeout=25) as client:
+        while cursor < end_ms:
+            try:
+                r = await client.get(f"{base}{path}", params={"symbol": symbol, "interval": "1h", "startTime": cursor, "endTime": end_ms, "limit": 1000})
+                r.raise_for_status()
+                batch = r.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                raise HTTPException(502, f"Saatlik fiyat geçmişi alınamadı: {type(exc).__name__}") from exc
+            if not isinstance(batch, list) or not batch:
+                break
+            for row in batch:
+                out[int(row[0])] = float(row[1])  # hourly OPEN, never future close
+            nxt = int(batch[-1][0]) + 1
+            if nxt <= cursor:
+                break
+            cursor = nxt
+            if len(batch) < 1000:
+                break
+    return out
+
+
+@app.get('/funding/backtest')
+async def funding_backtest(
+    symbol: str = Query('BTCUSDT'),
+    days: int = Query(30, ge=7, le=90),
+    hold_hours: int = Query(24, ge=8, le=72),
+    min_last_funding_pct: float = Query(0.005, ge=0, le=0.2),
+    cost_bps_per_leg_side: float = Query(10, ge=0, le=50),
+):
+    """Simplified cash-and-carry test: spot long + equal-coin perp short.
+
+    One unit of spot entry notional is the PnL denominator. Futures collateral,
+    liquidation, borrow, and transfer costs are NOT modeled.
+    """
+    symbol = symbol.upper()
+    check_symbol(symbol)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    hour_ms = 3_600_000
+    # Last fully opened hour only; avoid an incomplete interval for end exit.
+    end_ms = (now_ms // hour_ms - 1) * hour_ms
+    start_ms = end_ms - days * 24 * hour_ms
+    warmup_ms = start_ms - 48 * hour_ms
+    import asyncio
+    spot, perp, events = await asyncio.gather(
+        _hourly_history(SPOT, symbol, warmup_ms, end_ms, '/api/v3/klines'),
+        _hourly_history(FUTURES, symbol, warmup_ms, end_ms, '/fapi/v1/klines'),
+        _funding_history(symbol, warmup_ms, end_ms),
+    )
+    common = sorted(t for t in spot.keys() & perp.keys() if start_ms <= t <= end_ms)
+    if len(common) < 24 * 5 or not events:
+        raise HTTPException(503, 'Yeterli eşleştirilmiş spot/futures/funding verisi yok')
+    # Strictly previous funding event at the entry timestamp; never use future rates.
+    import bisect
+    event_times = [t for t, _ in events]
+    trades = []
+    i = 0
+    while i < len(common):
+        entry_t = common[i]
+        previous_idx = bisect.bisect_left(event_times, entry_t) - 1
+        if previous_idx < 0 or events[previous_idx][1] * 100 < min_last_funding_pct:
+            i += 1
+            continue
+        exit_t = entry_t + hold_hours * hour_ms
+        if exit_t not in spot or exit_t not in perp or exit_t > end_ms:
+            i += 1
+            continue
+        # Missing hourly data inside holding period invalidates this candidate.
+        if any(t not in spot or t not in perp for t in range(entry_t, exit_t + 1, hour_ms)):
+            i += 1
+            continue
+        s0, s1, f0, f1 = spot[entry_t], spot[exit_t], perp[entry_t], perp[exit_t]
+        if min(s0, s1, f0, f1) <= 0:
+            i += 1
+            continue
+        # Equal coin quantity: q=1/s0 so spot entry notional is 1.
+        spot_pnl_pct = (s1 - s0) / s0 * 100
+        perp_pnl_pct = (f0 - f1) / s0 * 100
+        # Funding paid/received by short uses funding-time markPrice proxy;
+        # official funding event rate is actual, but historical mark is not supplied.
+        # Hourly perp OPEN at or immediately after funding is only an approximation.
+        lo = bisect.bisect_right(event_times, entry_t)
+        hi = bisect.bisect_right(event_times, exit_t)
+        funding_pct = 0.0
+        funding_events = 0
+        valid = True
+        for ft, rate in events[lo:hi]:
+            proxy_hour = (ft // hour_ms) * hour_ms
+            if proxy_hour not in perp:
+                valid = False
+                break
+            funding_pct += rate * perp[proxy_hour] / s0 * 100
+            funding_events += 1
+        if not valid:
+            i += 1
+            continue
+        # Four fills: spot buy/sell and perp sell/buy; cost on each leg's notional.
+        fee_pct = (cost_bps_per_leg_side / 100) * (1 + s1/s0 + f0/s0 + f1/s0)
+        net_pct = spot_pnl_pct + perp_pnl_pct + funding_pct - fee_pct
+        trades.append({
+            'entry_utc': datetime.fromtimestamp(entry_t/1000, timezone.utc).isoformat(),
+            'exit_utc': datetime.fromtimestamp(exit_t/1000, timezone.utc).isoformat(),
+            'last_known_funding_pct': round(events[previous_idx][1]*100, 6),
+            'funding_events': funding_events,
+            'spot_pnl_pct': round(spot_pnl_pct, 5),
+            'futures_pnl_pct': round(perp_pnl_pct, 5),
+            'funding_pnl_pct': round(funding_pct, 5),
+            'cost_pct': round(fee_pct, 5),
+            'net_pct': round(net_pct, 5),
+        })
+        i = bisect.bisect_left(common, exit_t) + 1  # no overlap
+    vals = [t['net_pct'] for t in trades]
+    gross = [t['spot_pnl_pct'] + t['futures_pnl_pct'] + t['funding_pnl_pct'] for t in trades]
+    wins = sum(v > 0 for v in vals)
+    pos = sum(v for v in vals if v > 0)
+    neg = -sum(v for v in vals if v < 0)
+    equity, peak, dd = 1.0, 1.0, 0.0
+    for v in vals:
+        equity *= 1 + v/100
+        peak = max(peak, equity)
+        dd = max(dd, (peak-equity)/peak*100)
+    return {
+        'project': 'CRYPTO-RESEARCH-V1', 'version': '0.4.0', 'model': 'FA_A_HISTORICAL',
+        'symbol': symbol, 'days': days, 'hold_hours': hold_hours,
+        'paper_only': True, 'orders': False,
+        'matched_hourly_bars': len(common), 'historical_funding_events': len(events),
+        'parameters': {'min_last_funding_pct': min_last_funding_pct,
+                       'cost_bps_per_leg_side': cost_bps_per_leg_side},
+        'summary': {
+            'trades': len(trades), 'win_rate_pct': round(wins/len(vals)*100, 2) if vals else None,
+            'mean_gross_pct': round(sum(gross)/len(gross), 5) if gross else None,
+            'mean_net_pct': round(sum(vals)/len(vals), 5) if vals else None,
+            'compounded_return_pct': round((equity-1)*100, 4) if vals else None,
+            'profit_factor': round(pos/neg, 4) if neg else None,
+            'max_closed_trade_drawdown_pct': round(dd, 4) if vals else None,
+            'total_funding_pct': round(sum(t['funding_pnl_pct'] for t in trades), 5),
+            'total_basis_pnl_pct': round(sum(t['spot_pnl_pct'] + t['futures_pnl_pct'] for t in trades), 5),
+            'total_cost_pct': round(sum(t['cost_pct'] for t in trades), 5),
+        },
+        'last_10_trades': trades[-10:],
+        'limitations': [
+            'Funding rate is historical; payment notional uses an approximate hourly futures price, not historical funding mark.',
+            'Entry signal uses only the last realized funding rate, not a known future rate.',
+            'Spot and futures hourly open prices are assumed simultaneously executable; spread, depth and fill quality are not verified.',
+            'Funding cash flow is excluded at exact entry timestamp; funding after entry through exit is included.',
+            'No futures margin, liquidation, borrowing, funding settlement timing or intratrade drawdown model.',
+            'Return is normalized to spot notional, not total cash/collateral committed.',
+            'Compounded return is a research metric, not a realizable portfolio equity curve.',
+            'No live trading, no orders, no evidence of future profitability.',
+        ],
+    }
+
+# Ensure the old routes remain unchanged. Version is informational only.
+app.version = '0.4.0'
