@@ -32,7 +32,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "OK", "utc": datetime.now(timezone.utc).isoformat(), "paper_only": True, "trading": False, "orders": False, "version": "0.8.0"}
+    return {"status": "OK", "utc": datetime.now(timezone.utc).isoformat(), "paper_only": True, "trading": False, "orders": False, "version": "0.9.0"}
 
 @app.get("/mr/signal")
 async def mr_signal(symbol: str = Query("BTCUSDT"), interval: Literal["5m", "15m", "1h"] = "15m"):
@@ -256,7 +256,7 @@ async def mr_cost_analysis(
                 "max_closed_trade_drawdown_pct": r["summary"]["max_closed_trade_drawdown_pct"],
             })
     return {
-        "project": "CRYPTO-RESEARCH-V1", "version": "0.8.0",
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.9.0",
         "symbol": symbol, "interval": interval, "days": days,
         "data_bars": len(raw), "paper_only": True, "orders": False,
         "scenarios": results,
@@ -531,7 +531,7 @@ async def funding_carry_analysis(
             "latest_funding_minus_cost_pct": round_or_none(latest[1] - assumed_round_trip_cost_pct) if latest else None,
         })
     return {
-        "project": "CRYPTO-RESEARCH-V1", "version": "0.8.0",
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.9.0",
         "model": "FA_B_FUNDING_PERSISTENCE_DIAGNOSTIC",
         "symbol": symbol, "days": days, "paper_only": True, "orders": False,
         "period_funding_events": len(in_period),
@@ -686,7 +686,7 @@ async def funding_carry_basis_analysis(
         })
     return {
         "project": "CRYPTO-RESEARCH-V1",
-        "version": "0.8.0",
+        "version": "0.9.0",
         "model": "FA_B_RETROSPECTIVE_CARRY_BASIS",
         "symbol": symbol,
         "days": days,
@@ -827,7 +827,7 @@ async def funding_archive_status(symbol: Literal['BTCUSDT', 'ETHUSDT', 'SOLUSDT'
         for kind in ('spot', 'perp', 'funding'):
             part = await _archive_fetch(client, symbol, month, kind)
             data[kind] = {'rows': len(part), 'min_timestamp_ms': min(part) if part else None, 'max_timestamp_ms': max(part) if part else None}
-    return {'project': 'CRYPTO-RESEARCH-V1', 'version': '0.8.0', 'source': 'Binance Vision', 'month': month, 'symbol': symbol, 'datasets': data, 'paper_only': True, 'orders': False}
+    return {'project': 'CRYPTO-RESEARCH-V1', 'version': '0.9.0', 'source': 'Binance Vision', 'month': month, 'symbol': symbol, 'datasets': data, 'paper_only': True, 'orders': False}
 
 @app.get("/funding/carry-backtest")
 async def funding_carry_backtest(
@@ -943,7 +943,7 @@ async def funding_carry_backtest(
             "trades": [{k: v for k, v in t.items() if not k.startswith("_")} for t in trades],
         })
     return {
-        "project": "CRYPTO-RESEARCH-V1", "version": "0.8.0",
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.9.0",
         "model": "FA_B_CHRONOLOGICAL_PAPER_BACKTEST",
         "symbol": symbol, "days": days,
         "lookback_days": lookback_days,
@@ -1052,7 +1052,7 @@ async def funding_reversal_risk(
             "largest_daily_peak_to_trough_pct_points": max((r["max_daily_peak_to_trough_pct_points"] for r in subset), default=None),
         })
     return {
-        "project": "CRYPTO-RESEARCH-V1", "version": "0.8.0",
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.9.0",
         "model": "FA_B_FUNDING_REVERSAL_RISK_DIAGNOSTIC",
         "paper_only": True, "orders": False, "symbol": symbol, "days": days,
         "source": "Binance Vision completed monthly archives",
@@ -1065,4 +1065,144 @@ async def funding_reversal_risk(
             "No margin, liquidation, collateral, financing, spreads or slippage risk model.",
             "Tiny sample; descriptive diagnostics only, no reliable forecast or proven edge.",
         ],
+    }
+
+
+# V0.9 - Predeclared exit rules; no lookahead and no real orders.
+@app.get("/funding/exit-comparison")
+async def funding_exit_comparison(
+    symbol: Literal["BTCUSDT", "ETHUSDT", "SOLUSDT"] = "BTCUSDT",
+    days: int = Query(180, ge=120, le=180),
+    lookback_days: int = Query(7, ge=3, le=14),
+    min_past_funding_pct: float = Query(0.05, ge=0, le=1),
+):
+    import bisect
+    DAY, HOUR = 86400000, 3600000
+    now = datetime.now(timezone.utc)
+    end = int(datetime(now.year, now.month, 1, tzinfo=timezone.utc).timestamp()*1000) - DAY
+    start = end - days*DAY
+    split = start + (days*2//3)*DAY
+    spot, perp, events = await _archive_bundle(symbol, start-(lookback_days+3)*DAY, end)
+    times = [t for t, _ in events]
+    if len(events)<days or len(spot.keys() & perp.keys())<days*.9:
+        raise HTTPException(503, "Yeterli arşiv verisi bulunamadı")
+    output=[]
+    rules = ("fixed", "last_3d_negative", "last_7d_negative", "three_negative_days")
+    for hold in (30,45):
+        for rule in rules:
+            trades=[]
+            entry=start
+            while entry+hold*DAY <= end:
+                if entry not in spot or entry not in perp:
+                    entry+=DAY; continue
+                prior=events[bisect.bisect_left(times,entry-lookback_days*DAY):
+                             bisect.bisect_left(times,entry)]
+                prior_gaps=[entry-lookback_days*DAY]+[t for t,_ in prior]+[entry]
+                if len(prior)<lookback_days or any(b-a>36*HOUR for a,b in zip(prior_gaps,prior_gaps[1:])):
+                    entry+=DAY; continue
+                trailing=100*sum(r for _,r in prior)
+                if trailing<min_past_funding_pct:
+                    entry+=DAY; continue
+                if entry<split<entry+hold*DAY:
+                    entry=split; continue
+                s0,f0=spot[entry],perp[entry]
+                if min(s0,f0)<=0:
+                    entry+=DAY; continue
+                exit_t=None
+                reason="fixed_hold"
+                streak=0
+                for d in range(1,hold+1):
+                    day=entry+d*DAY
+                    if day not in spot or day not in perp:
+                        break
+                    # Funding events strictly earlier than today's daily open are known.
+                    today_events=events[bisect.bisect_left(times,day-DAY):
+                                        bisect.bisect_left(times,day)]
+                    if len(today_events)<1:
+                        break
+                    today_sum=sum(rate for _,rate in today_events)
+                    streak=streak+1 if today_sum<0 else 0
+                    if rule=="last_3d_negative" and d>=3:
+                        recent=events[bisect.bisect_left(times,day-3*DAY):
+                                      bisect.bisect_left(times,day)]
+                        trigger=sum(rate for _,rate in recent)<0
+                    elif rule=="last_7d_negative" and d>=7:
+                        recent=events[bisect.bisect_left(times,day-7*DAY):
+                                      bisect.bisect_left(times,day)]
+                        trigger=sum(rate for _,rate in recent)<0
+                    elif rule=="three_negative_days":
+                        trigger=streak>=3
+                    else:
+                        trigger=False
+                    if trigger:
+                        exit_t=day
+                        reason=rule
+                        break
+                    if d==hold:
+                        exit_t=day
+                if exit_t is None:
+                    entry+=DAY; continue
+                actual=events[bisect.bisect_right(times,entry):
+                              bisect.bisect_left(times,exit_t)]
+                gaps=[entry]+[t for t,_ in actual]+[exit_t]
+                if len(actual)<(exit_t-entry)//DAY or any(b-a>36*HOUR for a,b in zip(gaps,gaps[1:])):
+                    entry+=DAY; continue
+                if any((t//DAY)*DAY not in perp for t,_ in actual):
+                    entry+=DAY; continue
+                funding=sum(100*r*perp[(t//DAY)*DAY]/s0 for t,r in actual)
+                s1,f1=spot[exit_t],perp[exit_t]
+                basis=100*((s1-s0)+(f0-f1))/s0
+                gross=funding+basis
+                four=1+s1/s0+f0/s0+f1/s0
+                trades.append({
+                    "entry_utc":datetime.fromtimestamp(entry/1000,timezone.utc).isoformat(),
+                    "exit_utc":datetime.fromtimestamp(exit_t/1000,timezone.utc).isoformat(),
+                    "partition":"development" if exit_t<=split else "validation",
+                    "days_held":(exit_t-entry)//DAY,
+                    "exit_reason":reason,
+                    "gross_pct":round(gross,6),
+                    "net_low_pct":round(gross-0.02*four,6),
+                    "net_medium_pct":round(gross-0.04*four,6),
+                    "net_baseline_pct":round(gross-0.1*four,6),
+                })
+                entry=exit_t+DAY
+            summary=[]
+            for partition in ("development","validation"):
+                subset=[t for t in trades if t["partition"]==partition]
+                row={"partition":partition,"trades":len(subset),
+                     "early_exits":sum(t["exit_reason"]!="fixed_hold" for t in subset)}
+                for cost in ("low","medium","baseline"):
+                    vals=[t[f"net_{cost}_pct"] for t in subset]
+                    row[f"mean_net_{cost}_pct"]=round(sum(vals)/len(vals),6) if vals else None
+                    row[f"positive_{cost}_pct"]=round(100*sum(v>0 for v in vals)/len(vals),2) if vals else None
+                    eq=1.0
+                    for v in vals: eq*=1+v/100
+                    row[f"illustrative_compounded_{cost}_pct"]=round(100*(eq-1),6) if vals else None
+                summary.append(row)
+            output.append({"hold_days":hold,"exit_rule":rule,
+                           "total_trades":len(trades),"summaries":summary,"trades":trades})
+    return {
+        "project":"CRYPTO-RESEARCH-V1","version":"0.9.0",
+        "model":"FA_B_EXIT_RULE_COMPARISON",
+        "paper_only":True,"orders":False,
+        "symbol":symbol,"days":days,
+        "split_utc":datetime.fromtimestamp(split/1000,timezone.utc).isoformat(),
+        "data_source":"Binance Vision monthly ZIP archives",
+        "rules":{
+            "fixed":"Exit at 30/45 days",
+            "last_3d_negative":"Exit at next daily open when last 3 completed days' cumulative funding is negative",
+            "last_7d_negative":"Exit at next daily open when last 7 completed days' cumulative funding is negative",
+            "three_negative_days":"Exit at next daily open after 3 consecutive completed days with negative daily funding",
+        },
+        "results":output,
+        "limitations":[
+            "Different exit rules produce different subsequent entries; results are not matched-trade comparisons.",
+            "Rules selected after inspecting historical diagnostics: severe data snooping risk.",
+            "Very small independent trade counts; validation period was previously inspected.",
+            "Exit signals only use funding events strictly before daily open, not future funding.",
+            "Daily open approximations and daily perp-open funding notional; intraday risk not modeled.",
+            "Fees approximate four fills; excludes spread, slippage, financing, margin and liquidation.",
+            "Returns are relative to spot entry notional, not total committed capital.",
+            "Historical research only; no live trades or proof of profitability."
+        ]
     }
