@@ -2862,3 +2862,97 @@ async def funding_v24_settlement_proxy_reconciliation(
             "Illustrative costs cover four fills and exclude changing notional, basis PnL, margin financing, liquidation and capital requirements.",
             "No funding payment ledger; no real fills; no out-of-sample validation.",
             "PAPER ONLY; NO ORDERS."]}
+
+
+@app.get("/funding/v25-multistage-research")
+async def funding_v25_multistage_research(
+    symbol: Literal["BTCUSDT","ETHUSDT","SOLUSDT"]="BTCUSDT",
+    days: int=Query(1095,ge=365,le=1095),
+    spot_notional_usdt: float=Query(1000.0,gt=0,le=100000),
+    margin_fraction: float=Query(0.5,ge=0.1,le=1),
+    reserve_fraction: float=Query(0.5,ge=0,le=2),
+    annual_opportunity_cost_pct: float=Query(0.0,ge=0,le=30),
+):
+    """Multi-stage 2025/2026 robustness and capital efficiency audit; proxy only."""
+    import statistics
+    # Reuse exact V2.2 scenarios, avoiding inconsistent duplicated computations.
+    v22=await funding_v22_holding_period_research(symbol=symbol,days=days,
+                                                 spot_notional_usdt=spot_notional_usdt)
+    capital=spot_notional_usdt*(1+margin_fraction+reserve_fraction)
+    cases=[]
+    for item in v22["results"]:
+        if item["exit_rule"] not in ("FIXED_30D","FIXED_45D","EARLY_EXIT_LAST_7D_NONPOSITIVE_MAX45D"):
+            continue
+        recent=item["from_2025"]
+        y26=item["year_2026"]
+        n=recent.get("trades",0)
+        if not n:continue
+        total=recent["net_proxy_total_usdt"]
+        holding=recent["mean_days_held"]
+        opp_cost=capital*annual_opportunity_cost_pct/100*holding/365*n
+        adjusted=total-opp_cost
+        # An equivalent fee budget is the difference between gross proxy and execution costs.
+        gross=recent["funding_proxy_total_usdt"]+recent["basis_total_usdt"]
+        cost=recent["execution_cost_total_usdt"]
+        cases.append({
+            "entry_filter":item["entry_filter"],"exit_rule":item["exit_rule"],
+            "cost_case":item["cost_case"],"trades_2025_plus":n,
+            "net_proxy_total_2025_plus_usdt":round(total,4),
+            "mean_net_per_trade_usdt":round(total/n,4),
+            "gross_proxy_2025_plus_usdt":round(gross,4),
+            "execution_cost_2025_plus_usdt":round(cost,4),
+            "gross_to_execution_cost_ratio":round(gross/cost,4) if cost>0 else None,
+            "opportunity_cost_2025_plus_usdt":round(opp_cost,4),
+            "adjusted_total_2025_plus_usdt":round(adjusted,4),
+            "net_per_trade_pct_of_assumed_capital":round(100*adjusted/n/capital,6),
+            "positive_trades_2025_plus":recent["positive_trades"],
+            "trades_2026":y26.get("trades",0),
+            "net_proxy_2026_usdt":y26.get("net_proxy_total_usdt"),
+            "mean_days_held":holding,
+            "positive_both_periods":adjusted>0 and y26.get("net_proxy_total_usdt",0)>0,
+        })
+    # Candidate ranking is descriptive, not trained/tested out of sample.
+    eligible=[x for x in cases if x["trades_2025_plus"]>=8]
+    ranking=sorted(eligible,key=lambda x:(x["positive_both_periods"],
+                     x["adjusted_total_2025_plus_usdt"]),reverse=True)
+    def compact(x):
+        return {k:x[k] for k in ("entry_filter","exit_rule","cost_case",
+          "trades_2025_plus","adjusted_total_2025_plus_usdt",
+          "net_per_trade_pct_of_assumed_capital","net_proxy_2026_usdt",
+          "positive_both_periods")}
+    base=[x for x in cases if x["cost_case"]=="BASE"]
+    by_filter={}
+    for filt in ("ALL_MONTHLY","PRIOR_7D_POSITIVE","PRIOR_30D_GE_0_30PCT"):
+        by_filter[filt]=[compact(x) for x in base if x["entry_filter"]==filt]
+    # Same entry anchors and model assumptions as V2.2: no genuine forward holdout.
+    return {"project":"CRYPTO-RESEARCH-V1","version":"2.5.0",
+      "paper_only":True,"trading":False,"orders":False,"symbol":symbol,
+      "research_stages":[
+        "1: Compare 30/45-day fixed exits and negative-funding early exit",
+        "2: Compare three past-only entry filters",
+        "3: Stress-test LOW/BASE/HIGH execution costs",
+        "4: Separate 2025+ from 2026 and count positive trades",
+        "5: Evaluate assumed locked capital and opportunity cost",
+        "6: Rank robustness candidates and report verification gaps"],
+      "capital_assumptions":{"spot_notional_usdt":spot_notional_usdt,
+        "perp_initial_margin_usdt":round(spot_notional_usdt*margin_fraction,4),
+        "reserve_usdt":round(spot_notional_usdt*reserve_fraction,4),
+        "assumed_capital_per_position_usdt":round(capital,4),
+        "annual_opportunity_cost_pct":annual_opportunity_cost_pct},
+      "data_audit":v22["data_audit"],
+      "base_cost_comparisons":by_filter,
+      "top_10_descriptive_rank": [compact(x) for x in ranking[:10]],
+      "scenarios_evaluated":len(cases),
+      "findings":{"any_base_cost_positive_2025_plus_and_2026":any(
+          x["positive_both_periods"] for x in base),
+        "all_base_cost_scenarios":len(base),
+        "note":"Positive proxy is not a validated executable trading edge."},
+      "critical_limitations":[
+        "Funding cashflow uses daily perpetual opens, not settlement mark prices or a ledger.",
+        "Mark 1h audit in V2.4 is not integrated into these 30/45-day PnLs.",
+        "Spot and short exposure are approximated by the legacy V2.2 model; precise coin quantities and executable bid/ask fills are not independently validated.",
+        "Opportunity cost assumes static capital per trade; overlapping positions are not portfolio simulated.",
+        "Capital requirement and reserve are assumptions; intraday liquidation, ADL, financing and margin transfers are not modeled.",
+        "Strategy ranking reuses historical observations; no out-of-sample proof.",
+        "Summed trade PnL is not portfolio CAGR.",
+        "PAPER ONLY; NO ORDERS."]}
