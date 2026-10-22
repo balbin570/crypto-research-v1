@@ -2765,3 +2765,100 @@ async def funding_v23_mark_data_audit(
             "No actual short position quantities or exchange account funding ledger.",
             "No authenticated credentials needed; do not share API keys.",
             "PAPER ONLY; NO ORDERS."]}
+
+
+@app.get("/funding/v24-settlement-proxy-reconciliation")
+async def funding_v24_settlement_proxy_reconciliation(
+    symbol: Literal["BTCUSDT","ETHUSDT","SOLUSDT"]="BTCUSDT",
+    month: str=Query("2026-08",pattern=r"^20[0-9]{2}-(0[1-9]|1[0-2])$"),
+    short_notional_usdt: float=Query(1000.0,gt=0,le=1000000),
+    fee_per_fill_bps: float=Query(10.0,ge=0,le=50),
+    slippage_per_fill_bps: float=Query(2.0,ge=0,le=50),
+):
+    """Monthly mark proxy comparison for fixed-quantity short; not an executable 45d backtest."""
+    import csv,io,zipfile,calendar,statistics
+    from datetime import datetime,timezone
+    y,m=map(int,month.split("-"))
+    now=datetime.now(timezone.utc)
+    if (y,m)>((now.year-1,12) if now.month==1 else (now.year,now.month-1)):
+        raise HTTPException(400,detail="Tamamlanmış bir geçmiş ay seçin")
+    url=f"{_ARCHIVE_ROOT}/futures/um/monthly/markPriceKlines/{symbol}/1h/{symbol}-1h-{month}.zip"
+    async with httpx.AsyncClient(timeout=60,follow_redirects=True) as client:
+        funding=await _archive_fetch(client,symbol,month,"funding")
+        try:
+            r=await client.get(url)
+            r.raise_for_status()
+            with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                names=[n for n in z.namelist() if n.lower().endswith(".csv")]
+                if len(names)!=1:raise ValueError("CSV missing or ambiguous")
+                marks={}
+                with z.open(names[0]) as f:
+                    for row in csv.reader(io.TextIOWrapper(f,encoding="utf-8-sig")):
+                        if len(row)<5:continue
+                        try:
+                            t=_archive_timestamp(row[0])
+                            o=float(row[1]);c=float(row[4])
+                            if o>0 and c>0:marks[t]=(o,c)
+                        except (ValueError,TypeError):continue
+        except (httpx.HTTPError,ValueError,zipfile.BadZipFile) as exc:
+            raise HTTPException(503,detail={"reason":"mark archive unavailable",
+                                           "type":type(exc).__name__}) from exc
+    H=3600000
+    # Fixed BTC quantity from first month's mark open: approximate neutral sizing,
+    # not actual filled contract quantity or position opened at each event.
+    first=min(marks) if marks else None
+    if first is None:raise HTTPException(503,detail="No mark candles")
+    reference=marks[first][0]
+    quantity=short_notional_usdt/reference
+    rows=[]
+    missing=[]
+    for ts,rate in sorted(funding.items()):
+        hour=ts//H*H
+        current=marks.get(hour)
+        previous=marks.get(hour-H)
+        if current is None or previous is None:
+            missing.append(datetime.fromtimestamp(ts/1000,timezone.utc).isoformat())
+            continue
+        # Positive funding means short receives funding on Binance USD-M.
+        current_open=current[0]
+        previous_close=previous[1]
+        rows.append({"time":ts,"rate":rate,
+                     "current_open":current_open,"previous_close":previous_close,
+                     "open_cash":quantity*current_open*rate,
+                     "prev_cash":quantity*previous_close*rate})
+    if not rows:raise HTTPException(503,detail="No funding-mark pairs")
+    funding_open=sum(x["open_cash"] for x in rows)
+    funding_prev=sum(x["prev_cash"] for x in rows)
+    # Illustrative two-leg entry+exit fees on notional, not a 45d strategy return.
+    roundtrip_cost=4*short_notional_usdt*(fee_per_fill_bps+slippage_per_fill_bps)/10000
+    def r6(x):return round(x,6)
+    return {"project":"CRYPTO-RESEARCH-V1","version":"2.4.0",
+        "paper_only":True,"trading":False,"orders":False,
+        "symbol":symbol,"month":month,"status":"MONTHLY_FUNDING_MARK_PROXY_COMPARISON",
+        "source_url":url,"mark_hourly_candles":len(marks),
+        "funding_events":len(funding),"paired_events":len(rows),
+        "missing_events":len(missing),"missing_event_samples":missing[:3],
+        "short_notional_usdt":short_notional_usdt,
+        "reference_mark_open":r6(reference),
+        "fixed_short_quantity_coin":round(quantity,10),
+        "funding_proxy_current_hour_open_usdt":r6(funding_open),
+        "funding_proxy_previous_hour_close_usdt":r6(funding_prev),
+        "proxy_difference_usdt":r6(funding_open-funding_prev),
+        "illustrative_four_fills_cost_usdt":r6(roundtrip_cost),
+        "funding_minus_illustrative_cost_current_open_usdt":r6(funding_open-roundtrip_cost),
+        "funding_minus_illustrative_cost_previous_close_usdt":r6(funding_prev-roundtrip_cost),
+        "sample_events":[{"funding_time_utc":datetime.fromtimestamp(x["time"]/1000,timezone.utc).isoformat(),
+                          "funding_rate":x["rate"],
+                          "current_hour_open":r6(x["current_open"]),
+                          "previous_hour_close":r6(x["previous_close"]),
+                          "funding_cash_open_usdt":r6(x["open_cash"]),
+                          "funding_cash_previous_close_usdt":r6(x["prev_cash"])}
+                         for x in rows[:5]],
+        "limitations":[
+            "Both prices are hourly proxies; neither is a verified settlement mark.",
+            "Previous hour close can be unavailable at month boundary.",
+            "Fixed coin quantity is assumed from the first hourly mark open of the month.",
+            "This is a single-month funding sensitivity audit, NOT a 45-day backtest.",
+            "Illustrative costs cover four fills and exclude changing notional, basis PnL, margin financing, liquidation and capital requirements.",
+            "No funding payment ledger; no real fills; no out-of-sample validation.",
+            "PAPER ONLY; NO ORDERS."]}
