@@ -1973,3 +1973,135 @@ async def funding_v15_comparison(
             "This endpoint does not simulate orders and must not be used for live trading."
         ]
     }
+
+
+# V1.6: recent-period robustness, financing, collateral and overlapping exposure.
+@app.get("/funding/v16-robustness")
+async def funding_v16_robustness(
+    symbol: Literal["BTCUSDT", "ETHUSDT", "SOLUSDT"] = "BTCUSDT",
+    days: int = Query(1095, ge=365, le=1095),
+    fee_per_fill_bps: float = Query(10.0, ge=0, le=50),
+    slippage_per_fill_bps: float = Query(2.0, ge=0, le=50),
+    financing_annual_pct: float = Query(0.0, ge=0, le=30),
+    perp_margin_fraction: float = Query(0.25, ge=0.05, le=1.0),
+    reserve_fraction: float = Query(0.25, ge=0.0, le=2.0),
+):
+    import statistics
+    from collections import defaultdict
+    from datetime import date, timedelta
+    # Reuse exact V1.5 matching logic. Costs computed here from the same proxy.
+    baseline = await funding_v15_comparison(
+        symbol=symbol, days=days,
+        fee_per_fill_bps=fee_per_fill_bps,
+        slippage_per_fill_bps=slippage_per_fill_bps,
+        financing_annual_pct=0.0,
+    )
+    entries = [r for r in baseline["monthly_matched_entries"] if r["horizon_days"] == 45]
+    if not entries:
+        raise HTTPException(status_code=503, detail="45 günlük eşleşmiş işlem bulunamadı")
+    filters = {
+        "ALL_MONTHLY": lambda r: True,
+        "PRIOR_7D_POSITIVE": lambda r: r["prior_7d_raw_rate_pct"] > 0,
+        "PRIOR_30D_GE_0_30PCT": lambda r: r["prior_30d_raw_rate_pct"] >= 0.30,
+    }
+    # Spot purchase uses 1 unit of capital. Perp margin and reserve must also be funded.
+    # A leveraged margin model is illustrative; liquidation/ADL risk is NOT modeled.
+    capital_multiple = 1.0 + perp_margin_fraction + reserve_fraction
+    scenarios = []
+    detail = []
+    for name, filt in filters.items():
+        selected = sorted((r for r in entries if filt(r)), key=lambda r:r["entry_utc"])
+        for annual_fin in sorted(set([0.0, 5.0, 10.0, float(financing_annual_pct)])):
+            vals=[]
+            for r in selected:
+                net_spot = r["net_proxy_pct"] - annual_fin * 45 / 365
+                net_capital = net_spot / capital_multiple
+                vals.append(net_capital)
+                if annual_fin == float(financing_annual_pct):
+                    detail.append({
+                        "strategy":name,"entry_utc":r["entry_utc"],
+                        "year":r["entry_year"],"horizon_days":45,
+                        "net_proxy_pct_spot_notional":round(net_spot,6),
+                        "net_proxy_pct_allocated_capital":round(net_capital,6),
+                        "funding_proxy_pct":r["funding_daily_open_proxy_pct"],
+                        "basis_pct":r["basis_pct"],
+                        "execution_cost_pct":r["execution_cost_pct"],
+                        "financing_cost_pct":round(annual_fin*45/365,6),
+                    })
+            by_year=[]
+            for y in sorted(set(r["entry_year"] for r in selected)):
+                yvals=[v for r,v in zip(selected,vals) if r["entry_year"]==y]
+                by_year.append({"year":y,"n":len(yvals),
+                                "mean_net_pct_allocated_capital":round(statistics.mean(yvals),6)})
+            recent=[v for r,v in zip(selected,vals) if r["entry_year"]>=2025]
+            scenarios.append({
+                "strategy":name,"financing_annual_pct":annual_fin,
+                "n":len(vals),
+                "mean_net_pct_allocated_capital":round(statistics.mean(vals),6) if vals else None,
+                "median_net_pct_allocated_capital":round(statistics.median(vals),6) if vals else None,
+                "win_rate_pct":round(100*sum(v>0 for v in vals)/len(vals),2) if vals else None,
+                "worst_net_pct_allocated_capital":round(min(vals),6) if vals else None,
+                "recent_2025_2026_n":len(recent),
+                "recent_2025_2026_mean_pct_allocated_capital":round(statistics.mean(recent),6) if recent else None,
+                "by_entry_year":by_year,
+            })
+    # Count overlapping 45-day positions, assuming each eligible first-of-month
+    # signal opens a new independent position. Do NOT add overlapping trade
+    # returns and interpret them as portfolio returns.
+    overlaps=[]
+    for name,filt in filters.items():
+        selected=sorted((r for r in entries if filt(r)),key=lambda r:r["entry_utc"])
+        changes=[]
+        for r in selected:
+            d=date.fromisoformat(r["entry_utc"])
+            changes.append((d,1))
+            changes.append((d+timedelta(days=45),-1))
+        open_count=peak=0
+        for _,delta in sorted(changes,key=lambda x:(x[0],x[1])):
+            open_count+=delta
+            peak=max(peak,open_count)
+        overlaps.append({
+            "strategy":name,"signals":len(selected),
+            "peak_simultaneous_positions":peak,
+            "required_capital_units_if_each_position_spot_notional_1":round(peak*capital_multiple,4),
+            "warning":"No portfolio CAGR, drawdown, liquidation or cash recycling simulation"
+        })
+    # Paired recent difference, exact same entry dates for both strategies.
+    all_recent={r["entry_utc"]:r for r in entries if r["entry_year"]>=2025}
+    filtered_recent={r["entry_utc"]:r for r in entries if r["entry_year"]>=2025 and filters["PRIOR_30D_GE_0_30PCT"](r)}
+    excluded_recent=[r for k,r in all_recent.items() if k not in filtered_recent]
+    return {
+        "project":"CRYPTO-RESEARCH-V1", "version":"1.6.0",
+        "model":"RECENT_FINANCING_COLLATERAL_ROBUSTNESS",
+        "paper_only":True,"trading":False,"orders":False,
+        "symbol":symbol,"days":days,
+        "inputs":{
+            "horizon_days":45,"fee_per_fill_bps":fee_per_fill_bps,
+            "slippage_per_fill_bps":slippage_per_fill_bps,
+            "requested_financing_annual_pct":financing_annual_pct,
+            "perp_margin_fraction":perp_margin_fraction,
+            "reserve_fraction":reserve_fraction,
+            "capital_multiple_per_spot_notional":capital_multiple,
+            "financing_assumption":"Annual funding/borrowing charge on spot-entry notional, not verified real borrowing terms"
+        },
+        "source_audit":baseline["data_audit"],
+        "scenarios":scenarios,
+        "overlap_analysis":overlaps,
+        "recent_filter_comparison":{
+            "all_2025_2026_months":len(all_recent),
+            "prior_30d_filter_selected":len(filtered_recent),
+            "prior_30d_filter_excluded":len(excluded_recent),
+            "excluded_dates":[r["entry_utc"] for r in excluded_recent],
+            "note":"Filtered strategy is a SUBSET of baseline, not an independent paired strategy. No causal performance claim."
+        },
+        "trade_details_at_requested_financing":detail,
+        "limitations":[
+            "Settlement-time mark prices remain unavailable and unverified; daily open funding proxy only.",
+            "Annual financing charge is hypothetical; real rates may vary daily and with margin/collateral.",
+            "Allocated capital = spot notional + perp margin fraction + reserve fraction, static assumption.",
+            "Leverage liquidation, ADL, margin calls, capital rebalancing and dynamic hedging NOT simulated.",
+            "Overlapping trades are NOT independent and reported averages are NOT portfolio returns.",
+            "Historical filter selection is subject to selection bias; no new independent forward sample.",
+            "No actual orders, trading, or verified realizable net profitability."
+        ]
+    }
