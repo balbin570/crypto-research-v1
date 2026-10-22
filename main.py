@@ -7,7 +7,7 @@ from typing import Literal
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="CRYPTO-RESEARCH-V1", version="2.0.0")
+app = FastAPI(title="CRYPTO-RESEARCH-V1", version="2.1.0")
 SPOT = "https://data-api.binance.vision"
 FUTURES = "https://fapi.binance.com"
 SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
@@ -2543,3 +2543,65 @@ async def funding_v20_capital_comparison(
             "PAPER ONLY; NO ORDERS.",
         ],
     }
+
+
+@app.get("/funding/v21-profitability-diagnostics")
+async def funding_v21_profitability_diagnostics(
+    symbol: Literal["BTCUSDT","ETHUSDT","SOLUSDT"]="BTCUSDT",
+    days: int=Query(1095,ge=365,le=1095),
+    spot_notional_usdt: float=Query(1000.0,gt=0,le=1000000),
+):
+    """Explain profitability changes; historical settlement ledger is NOT verified."""
+    import statistics
+    base=await funding_v15_comparison(symbol=symbol,days=days,
+        fee_per_fill_bps=0.0,slippage_per_fill_bps=0.0,financing_annual_pct=0.0)
+    rows=[r for r in base["monthly_matched_entries"] if r["horizon_days"]==45]
+    groups={
+        "ALL_MONTHLY":lambda r:True,
+        "PRIOR_7D_POSITIVE":lambda r:r["prior_7d_raw_rate_pct"]>0,
+        "PRIOR_30D_GE_0_30PCT":lambda r:r["prior_30d_raw_rate_pct"]>=0.30,
+    }
+    cost_cases={"LOW":(2,1),"BASE":(10,2),"HIGH":(15,5)}
+    def summary(items,fee,slip):
+        if not items:return {"trades":0,"funding_proxy_total_usdt":0,"basis_total_usdt":0,"execution_cost_total_usdt":0,"net_proxy_total_usdt":0,"positive_net_trades":0}
+        # V1.5 exact execution notional is not present in rows; approximate four fills.
+        cost_pct=4*(fee+slip)/100
+        funding=sum(r["funding_daily_open_proxy_pct"] for r in items)
+        basis=sum(r["basis_pct"] for r in items)
+        net=funding+basis-len(items)*cost_pct
+        return {"trades":len(items),"funding_proxy_total_usdt":round(funding*spot_notional_usdt/100,4),
+            "basis_total_usdt":round(basis*spot_notional_usdt/100,4),
+            "execution_cost_total_usdt":round(len(items)*cost_pct*spot_notional_usdt/100,4),
+            "net_proxy_total_usdt":round(net*spot_notional_usdt/100,4),
+            "mean_net_proxy_pct_spot_notional":round(net/len(items),6),
+            "positive_net_trades":sum(1 for r in items if r["funding_daily_open_proxy_pct"]+r["basis_pct"]>cost_pct),
+            "mean_prior_7d_rate_pct":round(statistics.mean(r["prior_7d_raw_rate_pct"] for r in items),6),
+            "mean_prior_30d_rate_pct":round(statistics.mean(r["prior_30d_raw_rate_pct"] for r in items),6)}
+    comparisons=[]
+    for name,rule in groups.items():
+        selected=[r for r in rows if rule(r)]
+        for cname,(fee,slip) in cost_cases.items():
+            comparisons.append({"strategy":name,"cost_case":cname,
+                "pre_2025":summary([r for r in selected if r["entry_year"]<2025],fee,slip),
+                "from_2025":summary([r for r in selected if r["entry_year"]>=2025],fee,slip),
+                "by_entry_year":{str(y):summary([r for r in selected if r["entry_year"]==y],fee,slip)
+                    for y in sorted(set(r["entry_year"] for r in selected))}})
+    return {"project":"CRYPTO-RESEARCH-V1","version":"2.1.0",
+        "model":"FUNDING_VS_BASIS_VS_COST_YEARLY_DECOMPOSITION",
+        "paper_only":True,"trading":False,"orders":False,"symbol":symbol,"days":days,
+        "spot_notional_usdt":spot_notional_usdt,
+        "verification":{"status":"NOT_VERIFIED_PROXY_ONLY",
+            "settlement_mark_price_verified":False,"actual_account_funding_ledger_verified":False,
+            "historical_funding_cashflows_are_daily_open_estimates":True},
+        "source_audit":base["data_audit"],"comparison":comparisons,
+        "next_data_requirements":["public settlement-time mark prices (where historically available)",
+            "historical short position quantity at each funding event",
+            "optional signed account funding ledger for reconciliation; never submit API credentials"],
+        "limitations":["This endpoint does NOT verify real funding settlement payments.",
+            "Funding decomposition uses DAILY OPEN perp prices rather than funding settlement marks.",
+            "Four execution fills use fixed entry notional, not actual exit notionals.",
+            "No financing cost is charged; fully cash-funded spot still has opportunity cost.",
+            "45-day positions can overlap; totals are not portfolio CAGR.",
+            "Historical filters were examined on the same data; not out-of-sample validation.",
+            "No intraday liquidation, basis path, ADL, or margin simulation.",
+            "PAPER ONLY; NO ORDERS."]}
