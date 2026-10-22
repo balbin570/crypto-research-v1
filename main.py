@@ -7,7 +7,7 @@ from typing import Literal
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="CRYPTO-RESEARCH-V1", version="1.8.0")
+app = FastAPI(title="CRYPTO-RESEARCH-V1", version="1.9.0")
 SPOT = "https://data-api.binance.vision"
 FUTURES = "https://fapi.binance.com"
 SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
@@ -2339,5 +2339,106 @@ async def funding_v18_cost_verification(
             'No liquidation, margin calls, intraday mark-to-market or collateral stress.',
             'Historical filter selection bias; no independent forward validation.',
             'PAPER ONLY. NO ORDERS.'
+        ]
+    }
+
+
+# V1.9: deterministic collateral stress and funding-verification readiness.
+# This is a risk sensitivity model, NOT an exchange liquidation engine.
+@app.get('/funding/v19-risk-audit')
+async def funding_v19_risk_audit(
+    symbol: Literal['BTCUSDT','ETHUSDT','SOLUSDT']='BTCUSDT',
+    days: int=Query(1095,ge=365,le=1095),
+    starting_capital_usdt: float=Query(10000.0,gt=0,le=100000000),
+    spot_notional_usdt: float=Query(1000.0,gt=0,le=1000000),
+    perp_margin_fraction: float=Query(0.25,gt=0,le=1),
+    reserve_fraction: float=Query(0.25,ge=0,le=2),
+    maintenance_margin_fraction: float=Query(0.005,ge=0,le=0.2),
+):
+    base=await funding_v15_comparison(symbol=symbol,days=days,
+        fee_per_fill_bps=0.0,slippage_per_fill_bps=0.0,financing_annual_pct=0.0)
+    rows=[r for r in base['monthly_matched_entries'] if r['horizon_days']==45]
+    if not rows:
+        raise HTTPException(status_code=503,detail='45 gunluk eslesen veri bulunamadi')
+    # Fully paid spot plus separately margined perp short; NO borrowing assumed.
+    locked=spot_notional_usdt*(1+perp_margin_fraction+reserve_fraction)
+    max_positions=int(starting_capital_usdt//locked)
+    scenarios=[]
+    for price_change_pct in [-50,-30,-20,-10,0,10,20,30,50,75,100]:
+        # A short loses when BTC rises; the spot gains approximately the same amount.
+        # The hedge's mark-to-market net is near zero BEFORE basis, fees and funding,
+        # but spot appreciation is not automatically transferred into futures margin.
+        short_pnl=-spot_notional_usdt*price_change_pct/100
+        spot_pnl=spot_notional_usdt*price_change_pct/100
+        short_notional_after=spot_notional_usdt*(1+price_change_pct/100)
+        maintenance=short_notional_after*maintenance_margin_fraction
+        margin_only=spot_notional_usdt*perp_margin_fraction+short_pnl
+        margin_with_reserve=margin_only+spot_notional_usdt*reserve_fraction
+        scenarios.append({
+            'spot_price_change_pct':price_change_pct,
+            'spot_unrealized_pnl_usdt':round(spot_pnl,4),
+            'perp_short_unrealized_pnl_usdt':round(short_pnl,4),
+            'combined_delta_neutral_pnl_before_basis_fees_funding_usdt':round(spot_pnl+short_pnl,4),
+            'perp_maintenance_requirement_assumed_usdt':round(maintenance,4),
+            'perp_margin_equity_without_reserve_usdt':round(margin_only,4),
+            'perp_margin_equity_if_reserve_transferred_usdt':round(margin_with_reserve,4),
+            'below_assumed_maintenance_without_reserve':margin_only<maintenance,
+            'below_assumed_maintenance_with_reserve':margin_with_reserve<maintenance,
+        })
+    # Simplified boundary: margin + short PnL = assumed maintenance.
+    # Not a true liquidation price: exchange tiers, mark price, fees, basis, and cross margin omitted.
+    def boundary(collateral_fraction):
+        denom=1+maintenance_margin_fraction
+        return round(100*(collateral_fraction-maintenance_margin_fraction)/denom,4)
+    recent=[r for r in rows if r['entry_utc']>='2025-01-01']
+    return {
+        'project':'CRYPTO-RESEARCH-V1','version':'1.9.0',
+        'model':'CASH_FUNDED_HEDGE_COLLATERAL_STRESS_AND_DATA_READINESS',
+        'paper_only':True,'trading':False,'orders':False,
+        'symbol':symbol,'days':days,
+        'funding_verification':{
+            'status':'NOT_VERIFIED_PROXY_ONLY',
+            'funding_settlement_mark_prices_verified':False,
+            'actual_account_funding_ledger_verified':False,
+            'funding_rate_history_is_not_cashflow':True,
+            'required_for_reconciliation':[
+                'funding timestamp and settlement mark price for every event',
+                'perp position quantity at every funding timestamp',
+                'signed credited/debited funding ledger per event',
+                'matching event identifiers and timestamp timezone normalization',
+            ],
+            'no_claim_of_actual_settlement_verification':True,
+        },
+        'historical_sample':{'monthly_45d_entries':len(rows),
+            'recent_2025_2026_entries':len(recent),
+            'source_audit':base['data_audit']},
+        'capital_plan':{
+            'starting_capital_usdt':starting_capital_usdt,
+            'spot_notional_usdt':spot_notional_usdt,
+            'spot_fully_paid_usdt':spot_notional_usdt,
+            'perp_initial_margin_assumed_usdt':round(spot_notional_usdt*perp_margin_fraction,4),
+            'reserve_assumed_usdt':round(spot_notional_usdt*reserve_fraction,4),
+            'locked_per_position_usdt':round(locked,4),
+            'maximum_positions_by_static_capital_only':max_positions,
+            'borrowing_assumed':False,
+            'financing_cost_assumed_pct':0,
+            'warning':'Spot is purchased with cash; zero borrowing cost is not zero opportunity cost or proof of a realizable hedge.'},
+        'risk_assumptions':{
+            'maintenance_margin_fraction_assumed':maintenance_margin_fraction,
+            'short_notional_held_fixed_at_entry_quantity':True,
+            'spot_profits_not_auto_transferred_to_perp_margin':True,
+            'reserve_transfer_assumed_in_with_reserve_case':True,
+            'estimated_up_move_pct_to_maintenance_without_reserve':boundary(perp_margin_fraction),
+            'estimated_up_move_pct_to_maintenance_with_reserve':boundary(perp_margin_fraction+reserve_fraction),
+            'thresholds_are_not_exchange_liquidation_prices':True},
+        'price_shock_scenarios':scenarios,
+        'limitations':[
+            'No verified settlement mark prices or account funding ledger; historical returns remain proxies.',
+            'Maintenance margin is user-assumed, not an exchange-specific tier or liquidation formula.',
+            'A price shock is not a full path simulation: mark price, basis, liquidity, fees, ADL, and margin transfers omitted.',
+            'Spot gains may not be available to defend isolated futures margin before liquidation.',
+            'No intraday backtest, portfolio drawdown or proof of profitable execution.',
+            'No borrowing assumes fully funded spot and does not include opportunity cost.',
+            'PAPER ONLY; NO ORDERS.'
         ]
     }
