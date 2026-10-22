@@ -1454,3 +1454,82 @@ async def funding_yearly_risk(
             "Research paper only; no trading or orders."
         ]
     }
+
+# V1.2: cost sensitivity and illustrative collateral stress, not an exchange margin simulator.
+@app.get('/funding/cost-collateral-analysis')
+async def funding_cost_collateral_analysis(
+    symbol: Literal['BTCUSDT','ETHUSDT','SOLUSDT'] = 'BTCUSDT',
+    days: int = Query(1095,ge=365,le=1095),
+    financing_annual_pct: float = Query(0.0,ge=0,le=30),
+    collateral_fraction_of_spot_notional: float = Query(1.0,ge=0.1,le=3.0),
+):
+    from collections import defaultdict
+    prior = await funding_yearly_risk(symbol=symbol,days=days)
+    scenarios = [
+        ('low',0.02,0.0),
+        ('medium',0.04,0.0),
+        ('baseline',0.10,0.0),
+        ('baseline_plus_2bps_slippage_each_fill',0.10,0.02),
+        ('baseline_plus_5bps_slippage_each_fill',0.10,0.05),
+        ('high_fee_plus_5bps_slippage_each_fill',0.15,0.05),
+    ]
+    results=[]
+    for strategy in prior['results']:
+        rows=[]
+        for scenario,fee_per_fill_pct,slippage_per_fill_pct in scenarios:
+            trades=[]
+            for trade in strategy['trades']:
+                # Same four price-weighted notionals used by the existing V1.1 fee baseline.
+                four_notional_factor = trade['four_fill_fee_baseline_pct']/0.1
+                execution_cost=(fee_per_fill_pct+slippage_per_fill_pct)*four_notional_factor
+                financing_cost=(financing_annual_pct*trade['days_held']/365.0)
+                net=trade['gross_pct']-execution_cost-financing_cost
+                # Simplified cash allocation assumes both legs are fully collateralized
+                # with cash equal to (1 + selected collateral fraction) x spot notional.
+                deployed_capital_factor=1.0+collateral_fraction_of_spot_notional
+                trades.append({
+                    'exit_year':int(trade['exit_utc'][:4]),
+                    'partition':trade['partition'],
+                    'net_pct_spot_notional':net,
+                    'net_pct_allocated_capital':net/deployed_capital_factor,
+                    'funding_pct':trade['funding_pct'],
+                    'execution_cost_pct':execution_cost,
+                    'financing_cost_pct':financing_cost,
+                    'days_held':trade['days_held'],
+                })
+            for group_name,group in [('all',trades),('development',[t for t in trades if t['partition']=='development']),('validation',[t for t in trades if t['partition']=='validation'])]:
+                if not group:continue
+                rows.append({
+                    'scenario':scenario,'period':group_name,'trades':len(group),
+                    'mean_net_pct_spot_notional':round(sum(t['net_pct_spot_notional'] for t in group)/len(group),6),
+                    'mean_net_pct_allocated_capital':round(sum(t['net_pct_allocated_capital'] for t in group)/len(group),6),
+                    'win_rate_pct':round(100*sum(t['net_pct_spot_notional']>0 for t in group)/len(group),2),
+                    'mean_execution_cost_pct':round(sum(t['execution_cost_pct'] for t in group)/len(group),6),
+                    'mean_financing_cost_pct':round(sum(t['financing_cost_pct'] for t in group)/len(group),6),
+                })
+            for year in sorted({t['exit_year'] for t in trades}):
+                subset=[t for t in trades if t['exit_year']==year]
+                rows.append({
+                    'scenario':scenario,'period':str(year),'trades':len(subset),
+                    'mean_net_pct_spot_notional':round(sum(t['net_pct_spot_notional'] for t in subset)/len(subset),6),
+                    'mean_net_pct_allocated_capital':round(sum(t['net_pct_allocated_capital'] for t in subset)/len(subset),6),
+                    'win_rate_pct':round(100*sum(t['net_pct_spot_notional']>0 for t in subset)/len(subset),2),
+                })
+        results.append({'exit_rule':strategy['exit_rule'],'hold_days':45,'total_trades':strategy['total_trades'],'scenarios':rows})
+    return {
+        'project':'CRYPTO-RESEARCH-V1','version':'1.2.0',
+        'model':'FA_B_COST_COLLATERAL_SENSITIVITY','paper_only':True,'orders':False,
+        'symbol':symbol,'days':days,'financing_annual_pct':financing_annual_pct,
+        'collateral_fraction_of_spot_notional':collateral_fraction_of_spot_notional,
+        'assumed_allocated_capital_multiple_of_spot_notional':1+collateral_fraction_of_spot_notional,
+        'scenarios':scenarios,'results':results,
+        'limitations':[
+            'Funding values are from V1.1, which approximates funding notional with daily perp opens; NOT settlement-time pricing.',
+            'Fees and slippage are hypothetical and may differ from actual venue/tier/market conditions.',
+            'Financing cost is a simple annualized input on spot notional, not a verified borrow quote.',
+            'Collateral fraction is only a user-selected capital-allocation denominator, NOT an exchange maintenance-margin or liquidation model.',
+            'No intraday high/low, liquidation engine, borrowing availability, ADL, margin calls or portfolio cross-margin.',
+            'Prior development/validation periods have been inspected; no independent out-of-sample proof.',
+            'Research only; no live trading, no orders.'
+        ]
+    }
