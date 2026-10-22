@@ -7,7 +7,7 @@ from typing import Literal
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="CRYPTO-RESEARCH-V1", version="0.5.0")
+app = FastAPI(title="CRYPTO-RESEARCH-V1", version="0.7.1")
 SPOT = "https://data-api.binance.vision"
 FUTURES = "https://fapi.binance.com"
 SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
@@ -28,11 +28,11 @@ def check_symbol(symbol: str):
 
 @app.get("/")
 def root():
-    return {"project": "CRYPTO-RESEARCH-V1", "mode": "RESEARCH_PAPER_ONLY", "orders": False, "routes": ["/health", "/mr/signal", "/funding/latest", "/mr/backtest", "/mr/cost-analysis", "/funding/backtest", "/funding/carry-analysis", "/funding/carry-basis-analysis", "/funding/carry-backtest", "/docs"]}
+    return {"project": "CRYPTO-RESEARCH-V1", "mode": "RESEARCH_PAPER_ONLY", "orders": False, "routes": ["/health", "/mr/signal", "/funding/latest", "/mr/backtest", "/mr/cost-analysis", "/funding/backtest", "/funding/carry-analysis", "/funding/carry-basis-analysis", "/funding/carry-backtest", "/funding/archive-status", "/docs"]}
 
 @app.get("/health")
 def health():
-    return {"status": "OK", "utc": datetime.now(timezone.utc).isoformat(), "paper_only": True, "trading": False, "orders": False, "version": "0.6.2"}
+    return {"status": "OK", "utc": datetime.now(timezone.utc).isoformat(), "paper_only": True, "trading": False, "orders": False, "version": "0.7.1"}
 
 @app.get("/mr/signal")
 async def mr_signal(symbol: str = Query("BTCUSDT"), interval: Literal["5m", "15m", "1h"] = "15m"):
@@ -256,7 +256,7 @@ async def mr_cost_analysis(
                 "max_closed_trade_drawdown_pct": r["summary"]["max_closed_trade_drawdown_pct"],
             })
     return {
-        "project": "CRYPTO-RESEARCH-V1", "version": "0.6.2",
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.7.1",
         "symbol": symbol, "interval": interval, "days": days,
         "data_bars": len(raw), "paper_only": True, "orders": False,
         "scenarios": results,
@@ -531,7 +531,7 @@ async def funding_carry_analysis(
             "latest_funding_minus_cost_pct": round_or_none(latest[1] - assumed_round_trip_cost_pct) if latest else None,
         })
     return {
-        "project": "CRYPTO-RESEARCH-V1", "version": "0.6.2",
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.7.1",
         "model": "FA_B_FUNDING_PERSISTENCE_DIAGNOSTIC",
         "symbol": symbol, "days": days, "paper_only": True, "orders": False,
         "period_funding_events": len(in_period),
@@ -686,7 +686,7 @@ async def funding_carry_basis_analysis(
         })
     return {
         "project": "CRYPTO-RESEARCH-V1",
-        "version": "0.6.2",
+        "version": "0.7.1",
         "model": "FA_B_RETROSPECTIVE_CARRY_BASIS",
         "symbol": symbol,
         "days": days,
@@ -712,6 +712,123 @@ async def funding_carry_basis_analysis(
 
 # V0.7: chronological, non-overlapping carry backtest.
 # The entry decision uses ONLY the previous seven days of realized funding.
+
+# V0.7.1: Binance Vision public monthly archives; no Binance Futures REST calls.
+import asyncio as _archive_asyncio
+import csv as _archive_csv
+import io as _archive_io
+import zipfile as _archive_zipfile
+from collections import OrderedDict as _ArchiveOrderedDict
+
+_ARCHIVE_ROOT = "https://data.binance.vision/data"
+_ARCHIVE_CACHE = _ArchiveOrderedDict()
+_ARCHIVE_LOCK = _archive_asyncio.Lock()
+_ARCHIVE_MAX_CACHE = 96
+
+def _archive_months(start_ms, end_ms):
+    start = datetime.fromtimestamp(start_ms / 1000, timezone.utc)
+    end = datetime.fromtimestamp(end_ms / 1000, timezone.utc)
+    y, m = start.year, start.month
+    result = []
+    while (y, m) <= (end.year, end.month):
+        result.append(f"{y:04d}-{m:02d}")
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return result
+
+def _archive_url(symbol, month, kind):
+    if kind == "spot":
+        return f"{_ARCHIVE_ROOT}/spot/monthly/klines/{symbol}/1d/{symbol}-1d-{month}.zip"
+    if kind == "perp":
+        return f"{_ARCHIVE_ROOT}/futures/um/monthly/klines/{symbol}/1d/{symbol}-1d-{month}.zip"
+    return f"{_ARCHIVE_ROOT}/futures/um/monthly/fundingRate/{symbol}/{symbol}-fundingRate-{month}.zip"
+
+def _archive_timestamp(value):
+    x = int(float(value))
+    if x >= 10**14:  # Binance spot klines after 2025 use microseconds
+        x //= 1000
+    return x
+
+def _archive_parse(content, kind):
+    with _archive_zipfile.ZipFile(_archive_io.BytesIO(content)) as z:
+        names = [n for n in z.namelist() if n.lower().endswith('.csv') and not n.startswith('__MACOSX')]
+        if len(names) != 1:
+            raise ValueError("Arşivde tek CSV bulunamadı")
+        with z.open(names[0]) as f:
+            reader = _archive_csv.reader(_archive_io.TextIOWrapper(f, encoding='utf-8-sig'))
+            header = next(reader, None)
+            if header is None:
+                raise ValueError("Boş CSV")
+            # Klines may have header or no header.
+            if kind != 'funding':
+                rows = []
+                if header and header[0].strip().isdigit():
+                    rows.append(header)
+                rows.extend(reader)
+                return {_archive_timestamp(row[0]): float(row[1]) for row in rows if len(row) > 1}
+            # Funding archive uses calc_time, funding_interval_hours, last_funding_rate.
+            normalized = [c.strip().lower().replace(' ', '_') for c in header]
+            if 'calc_time' in normalized or 'fundingtime' in normalized:
+                t_idx = normalized.index('calc_time') if 'calc_time' in normalized else normalized.index('fundingtime')
+                rate_idx = next((normalized.index(k) for k in ('last_funding_rate', 'fundingrate', 'funding_rate') if k in normalized), None)
+                if rate_idx is None:
+                    raise ValueError('Funding rate sütunu bulunamadı')
+                rows = reader
+            else:
+                # Never guess a funding CSV column mapping.
+                raise ValueError(f'Bilinmeyen funding CSV başlıkları: {header[:5]}')
+            return {_archive_timestamp(row[t_idx]): float(row[rate_idx]) for row in rows if len(row) > max(t_idx, rate_idx)}
+
+async def _archive_fetch(client, symbol, month, kind):
+    key = (symbol, month, kind)
+    async with _ARCHIVE_LOCK:
+        if key in _ARCHIVE_CACHE:
+            _ARCHIVE_CACHE.move_to_end(key)
+            return _ARCHIVE_CACHE[key]
+    url = _archive_url(symbol, month, kind)
+    try:
+        response = await client.get(url)
+        response.raise_for_status()
+        parsed = _archive_parse(response.content, kind)
+    except (httpx.HTTPError, ValueError, _archive_zipfile.BadZipFile) as exc:
+        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+        raise HTTPException(503, detail={
+            'error': 'Binance arşiv dosyası alınamadı veya okunamadı',
+            'dataset': kind, 'month': month, 'http_status': status,
+            'exception': type(exc).__name__, 'note': str(exc)[:180] if status is None else 'Arşiv erişimi başarısız'
+        }) from exc
+    async with _ARCHIVE_LOCK:
+        _ARCHIVE_CACHE[key] = parsed
+        _ARCHIVE_CACHE.move_to_end(key)
+        while len(_ARCHIVE_CACHE) > _ARCHIVE_MAX_CACHE:
+            _ARCHIVE_CACHE.popitem(last=False)
+    return parsed
+
+async def _archive_bundle(symbol, start_ms, end_ms):
+    months = _archive_months(start_ms, end_ms)
+    # A small concurrency limit avoids bursts and keeps Render memory bounded.
+    async with httpx.AsyncClient(timeout=45, follow_redirects=True) as client:
+        spot, perp, funding = {}, {}, {}
+        for month in months:
+            for kind, target in [('spot', spot), ('perp', perp), ('funding', funding)]:
+                part = await _archive_fetch(client, symbol, month, kind)
+                target.update(part)
+    spot = {t: p for t, p in spot.items() if start_ms <= t <= end_ms}
+    perp = {t: p for t, p in perp.items() if start_ms <= t <= end_ms}
+    events = sorted((t, r) for t, r in funding.items() if start_ms <= t <= end_ms)
+    return spot, perp, events
+
+@app.get('/funding/archive-status')
+async def funding_archive_status(symbol: Literal['BTCUSDT', 'ETHUSDT', 'SOLUSDT'] = 'BTCUSDT'):
+    now = datetime.now(timezone.utc)
+    y, m = (now.year - 1, 12) if now.month == 1 else (now.year, now.month - 1)
+    month = f'{y:04d}-{m:02d}'
+    async with httpx.AsyncClient(timeout=35, follow_redirects=True) as client:
+        data = {}
+        for kind in ('spot', 'perp', 'funding'):
+            part = await _archive_fetch(client, symbol, month, kind)
+            data[kind] = {'rows': len(part), 'min_timestamp_ms': min(part) if part else None, 'max_timestamp_ms': max(part) if part else None}
+    return {'project': 'CRYPTO-RESEARCH-V1', 'version': '0.7.1', 'source': 'Binance Vision', 'month': month, 'symbol': symbol, 'datasets': data, 'paper_only': True, 'orders': False}
+
 @app.get("/funding/carry-backtest")
 async def funding_carry_backtest(
     symbol: Literal["BTCUSDT", "ETHUSDT", "SOLUSDT"] = "BTCUSDT",
@@ -724,14 +841,12 @@ async def funding_carry_backtest(
     DAY = 86_400_000
     HOUR = 3_600_000
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    end = (now_ms // DAY - 1) * DAY
+    # Monthly funding archives are only used through the last completed month.
+    today = datetime.now(timezone.utc)
+    end = int(datetime(today.year, today.month, 1, tzinfo=timezone.utc).timestamp() * 1000) - DAY
     start = end - days * DAY
     warmup = start - (lookback_days + 2) * DAY
-    spot, perp, events = await asyncio.gather(
-        _daily_history(SPOT, symbol, warmup, end, "/api/v3/klines"),
-        _daily_history(FUTURES, symbol, warmup, end, "/fapi/v1/klines"),
-        _funding_history(symbol, warmup, end),
-    )
+    spot, perp, events = await _archive_bundle(symbol, warmup, end)
     times = [t for t, _ in events]
     if len(spot.keys() & perp.keys()) < days * 0.9 or len(events) < days:
         raise HTTPException(503, "Yeterli tarihsel veri bulunamadı")
@@ -828,13 +943,13 @@ async def funding_carry_backtest(
             "trades": [{k: v for k, v in t.items() if not k.startswith("_")} for t in trades],
         })
     return {
-        "project": "CRYPTO-RESEARCH-V1", "version": "0.7.0",
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.7.1",
         "model": "FA_B_CHRONOLOGICAL_PAPER_BACKTEST",
         "symbol": symbol, "days": days,
         "lookback_days": lookback_days,
         "min_past_funding_pct": min_past_funding_pct,
         "development_validation_split_utc": datetime.fromtimestamp(split/1000, timezone.utc).isoformat(),
-        "paper_only": True, "orders": False, "results": results,
+        "paper_only": True, "orders": False, "data_source": "Binance Vision monthly ZIP archives", "archive_end_utc": datetime.fromtimestamp(end/1000, timezone.utc).isoformat(), "results": results,
         "limitations": [
             "Entry rule is fixed, uses only realized historical funding known before entry.",
             "Chronological split does not guarantee independent market regimes; very few trades expected.",
@@ -844,5 +959,6 @@ async def funding_carry_backtest(
             "No intratrade basis drawdown, margin, liquidation, financing, collateral, borrowing or transfer model.",
             "Returns normalized to spot entry notional, not total capital; compounding is illustrative.",
             "Funding is realized after entry; not known in advance. No live orders or profitability guarantee.",
+            "Only completed monthly archives are used, so results end at the prior month.",
         ],
     }
