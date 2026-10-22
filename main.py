@@ -7,7 +7,7 @@ from typing import Literal
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="CRYPTO-RESEARCH-V1", version="1.7.0")
+app = FastAPI(title="CRYPTO-RESEARCH-V1", version="1.8.0")
 SPOT = "https://data-api.binance.vision"
 FUTURES = "https://fapi.binance.com"
 SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
@@ -2258,5 +2258,86 @@ async def funding_v17_portfolio_audit(
             "Historical selection bias and no independent forward validation.",
             "Portfolio returns are historical PROXY simulations, not executable returns.",
             "NO REAL ORDERS; PAPER ONLY."
+        ]
+    }
+
+# V1.8: scenario grid using the SAME archived matched-entry observations.
+# This is deliberately NOT a settlement-cashflow verification endpoint.
+@app.get('/funding/v18-cost-verification')
+async def funding_v18_cost_verification(
+    symbol: Literal['BTCUSDT','ETHUSDT','SOLUSDT']='BTCUSDT',
+    days: int=Query(1095,ge=365,le=1095),
+    spot_notional_usdt: float=Query(1000.0,gt=0,le=1000000),
+):
+    import statistics
+    base=await funding_v15_comparison(symbol=symbol,days=days,
+        fee_per_fill_bps=0.0,slippage_per_fill_bps=0.0,financing_annual_pct=0.0)
+    rows=[r for r in base['monthly_matched_entries'] if r['horizon_days']==45]
+    if not rows:
+        raise HTTPException(status_code=503,detail='45 gunluk eslesen veri bulunamadi')
+    strategies={
+        'ALL_MONTHLY':lambda r:True,
+        'PRIOR_7D_POSITIVE':lambda r:r['prior_7d_raw_rate_pct']>0,
+        'PRIOR_30D_GE_0_30PCT':lambda r:r['prior_30d_raw_rate_pct']>=0.30,
+    }
+    # Spot buy/sell and perp short open/close = 4 fills in total.
+    # fee_per_fill_bps and slippage_per_fill_bps each apply to each fill.
+    cost_cases=[('LOW',2.0,1.0),('BASE',10.0,2.0),('HIGH',15.0,5.0)]
+    financing_rates=[0.0,2.5,5.0,10.0]
+    scenarios=[]
+    for strategy,eligible in strategies.items():
+        chosen=[r for r in rows if eligible(r)]
+        for label,fee,slip in cost_cases:
+            execution_pct=4*(fee+slip)/100.0
+            for finance in financing_rates:
+                financing_pct=finance*45/365
+                all_net=[r['net_proxy_pct']-execution_pct-financing_pct for r in chosen]
+                recent=[r['net_proxy_pct']-execution_pct-financing_pct for r in chosen
+                        if r['entry_utc']>='2025-01-01']
+                scenarios.append({
+                    'strategy':strategy,'cost_case':label,
+                    'fee_per_fill_bps':fee,'slippage_per_fill_bps':slip,
+                    'execution_cost_pct_spot_notional':round(execution_pct,6),
+                    'financing_annual_pct':finance,
+                    'financing_45d_pct_spot_notional':round(financing_pct,6),
+                    'trades':len(all_net),
+                    'total_net_proxy_usdt_fixed_notional':round(sum(all_net)*spot_notional_usdt/100,4),
+                    'mean_net_proxy_pct_spot_notional':round(statistics.mean(all_net),6) if all_net else None,
+                    'recent_2025_2026_trades':len(recent),
+                    'recent_2025_2026_total_net_proxy_usdt':round(sum(recent)*spot_notional_usdt/100,4),
+                    'recent_2025_2026_mean_net_proxy_pct_spot_notional':round(statistics.mean(recent),6) if recent else None,
+                    'recent_2025_2026_positive_trades':sum(x>0 for x in recent),
+                })
+    diffs=[r['funding_daily_open_proxy_pct']-r['raw_rate_sum_pct'] for r in rows]
+    return {
+        'project':'CRYPTO-RESEARCH-V1','version':'1.8.0',
+        'model':'EXECUTION_FINANCING_SENSITIVITY_AND_FUNDING_DATA_GAP',
+        'paper_only':True,'trading':False,'orders':False,
+        'symbol':symbol,'days':days,'spot_notional_usdt':spot_notional_usdt,
+        'source_audit':base['data_audit'],
+        'funding_verification':{
+            'status':'NOT_VERIFIED_PROXY_ONLY',
+            'settlement_mark_price_available':False,
+            'actual_funding_cashflows_reconciled':False,
+            'monthly_45d_samples':len(rows),
+            'proxy_minus_raw_rate_mean_percentage_points':round(statistics.mean(diffs),6),
+            'proxy_minus_raw_rate_median_abs_percentage_points':round(statistics.median(map(abs,diffs)),6),
+            'proxy_minus_raw_rate_max_abs_percentage_points':round(max(map(abs,diffs)),6),
+            'required_for_verification':['timestamped settlement mark price',
+                'position quantity at each settlement','actual credited funding ledger'],
+        },
+        'cost_cases':[{ 'name':n,'fee_per_fill_bps':f,'slippage_per_fill_bps':s}
+                      for n,f,s in cost_cases],
+        'financing_annual_pct_cases':financing_rates,
+        'scenarios':scenarios,
+        'limitations':[
+            'No verified settlement-time mark prices or credited funding ledger.',
+            'Scenario returns are proxy estimates, not executable or realized profits.',
+            'Financing is hypothetical and constant over the 45-day holding period.',
+            'Four execution fills assumed; actual fee tier, spreads, and slippage may differ.',
+            'Overlapping positions are summed; total USDT is not portfolio equity or CAGR.',
+            'No liquidation, margin calls, intraday mark-to-market or collateral stress.',
+            'Historical filter selection bias; no independent forward validation.',
+            'PAPER ONLY. NO ORDERS.'
         ]
     }
