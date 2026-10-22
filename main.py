@@ -28,11 +28,11 @@ def check_symbol(symbol: str):
 
 @app.get("/")
 def root():
-    return {"project": "CRYPTO-RESEARCH-V1", "mode": "RESEARCH_PAPER_ONLY", "orders": False, "routes": ["/health", "/mr/signal", "/funding/latest", "/mr/backtest", "/mr/cost-analysis", "/funding/backtest", "/funding/carry-analysis", "/docs"]}
+    return {"project": "CRYPTO-RESEARCH-V1", "mode": "RESEARCH_PAPER_ONLY", "orders": False, "routes": ["/health", "/mr/signal", "/funding/latest", "/mr/backtest", "/mr/cost-analysis", "/funding/backtest", "/funding/carry-analysis", "/funding/carry-basis-analysis", "/docs"]}
 
 @app.get("/health")
 def health():
-    return {"status": "OK", "utc": datetime.now(timezone.utc).isoformat(), "paper_only": True, "trading": False, "orders": False, "version": "0.5.0"}
+    return {"status": "OK", "utc": datetime.now(timezone.utc).isoformat(), "paper_only": True, "trading": False, "orders": False, "version": "0.6.0"}
 
 @app.get("/mr/signal")
 async def mr_signal(symbol: str = Query("BTCUSDT"), interval: Literal["5m", "15m", "1h"] = "15m"):
@@ -256,7 +256,7 @@ async def mr_cost_analysis(
                 "max_closed_trade_drawdown_pct": r["summary"]["max_closed_trade_drawdown_pct"],
             })
     return {
-        "project": "CRYPTO-RESEARCH-V1", "version": "0.5.0",
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.6.0",
         "symbol": symbol, "interval": interval, "days": days,
         "data_bars": len(raw), "paper_only": True, "orders": False,
         "scenarios": results,
@@ -450,7 +450,7 @@ async def funding_backtest(
     }
 
 # Ensure the old routes remain unchanged. Version is informational only.
-app.version = '0.5.0'
+app.version = '0.6.0'
 
 
 # V0.5: Funding carry diagnostics, strictly descriptive and research-only.
@@ -529,7 +529,7 @@ async def funding_carry_analysis(
             "latest_funding_minus_cost_pct": round_or_none(latest[1] - assumed_round_trip_cost_pct) if latest else None,
         })
     return {
-        "project": "CRYPTO-RESEARCH-V1", "version": "0.5.0",
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.6.0",
         "model": "FA_B_FUNDING_PERSISTENCE_DIAGNOSTIC",
         "symbol": symbol, "days": days, "paper_only": True, "orders": False,
         "period_funding_events": len(in_period),
@@ -549,5 +549,136 @@ async def funding_carry_analysis(
             "No spot/perp basis PnL, spreads, slippage, borrow, margin, liquidation or collateral modeling.",
             "Funding settlement intervals can vary; data completeness is approximated by event count and gaps.",
             "A positive funding-minus-cost figure does not establish arbitrage profitability.",
+        ],
+    }
+
+
+# V0.6: Historical spot/perpetual carry with realized funding and basis PnL.
+# This is a retrospective rolling-window diagnostic, NOT a forward-entry backtest.
+@app.get("/funding/carry-basis-analysis")
+async def funding_carry_basis_analysis(
+    symbol: Literal["BTCUSDT", "ETHUSDT", "SOLUSDT"] = "BTCUSDT",
+    days: int = Query(180, ge=60, le=180),
+    sample_every_hours: int = Query(24, ge=24, le=168),
+):
+    import asyncio
+    import bisect
+
+    hour_ms = 3_600_000
+    day_ms = 24 * hour_ms
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    # Last fully completed hour's OPEN is an available historical price.
+    end_ms = (now_ms // hour_ms - 1) * hour_ms
+    start_ms = end_ms - days * day_ms
+    spot, perp, events = await asyncio.gather(
+        _hourly_history(SPOT, symbol, start_ms, end_ms, "/api/v3/klines"),
+        _hourly_history(FUTURES, symbol, start_ms, end_ms, "/fapi/v1/klines"),
+        _funding_history(symbol, start_ms, end_ms),
+    )
+    common = sorted(set(spot) & set(perp))
+    if len(common) < days * 20 or len(events) < days:
+        raise HTTPException(503, "Yeterli eşleşen saatlik spot/perp veya funding geçmişi yok")
+    event_times = [t for t, _ in events]
+    durations = (7, 14, 30, 45)
+    cost_scenarios = [
+        ("low_cost", 2.0),       # 4 sides x 2 bps ~ 0.08%
+        ("medium_cost", 4.0),    # 4 sides x 4 bps ~ 0.16%
+        ("baseline_cost", 10.0), # 4 sides x 10 bps ~ 0.40%
+    ]
+    analyses = []
+    for duration_days in durations:
+        duration_ms = duration_days * day_ms
+        records = []
+        # Each entry is a sampled historical start, not a trading signal.
+        for entry_t in range(start_ms, end_ms - duration_ms + 1, sample_every_hours * hour_ms):
+            exit_t = entry_t + duration_ms
+            if entry_t not in spot or entry_t not in perp or exit_t not in spot or exit_t not in perp:
+                continue
+            # Reject missing interior hourly bars, including gaps in either market.
+            if any(t not in spot or t not in perp for t in range(entry_t, exit_t + 1, hour_ms)):
+                continue
+            s0, s1, f0, f1 = spot[entry_t], spot[exit_t], perp[entry_t], perp[exit_t]
+            if min(s0, s1, f0, f1) <= 0:
+                continue
+            lo = bisect.bisect_right(event_times, entry_t)
+            hi = bisect.bisect_right(event_times, exit_t)
+            funding_events = events[lo:hi]
+            if len(funding_events) < duration_days:
+                continue
+            # Do not treat missing funding data as zero payments.
+            times = [entry_t] + [t for t, _ in funding_events] + [exit_t]
+            if any(b - a > 36 * hour_ms for a, b in zip(times, times[1:])):
+                continue
+            funding_pct = 0.0
+            for t, rate in funding_events:
+                proxy_hour = (t // hour_ms) * hour_ms
+                if proxy_hour not in perp:
+                    funding_pct = None
+                    break
+                funding_pct += 100 * rate * perp[proxy_hour] / s0
+            if funding_pct is None:
+                continue
+            # Equal coin quantity; returns normalized to entry spot notional.
+            basis_pct = 100 * ((s1 - s0) + (f0 - f1)) / s0
+            gross_pct = funding_pct + basis_pct
+            # Fee model accounts for changing notional on all four fills.
+            four_sides_notional = 1 + s1/s0 + f0/s0 + f1/s0
+            records.append({
+                "entry_utc": datetime.fromtimestamp(entry_t/1000, timezone.utc).isoformat(),
+                "exit_utc": datetime.fromtimestamp(exit_t/1000, timezone.utc).isoformat(),
+                "funding_events": len(funding_events),
+                "funding_pct": funding_pct,
+                "basis_pnl_pct": basis_pct,
+                "gross_pct": gross_pct,
+                "cost_multiplier": four_sides_notional,
+            })
+
+        scenarios = []
+        for label, bps in cost_scenarios:
+            values = [r["gross_pct"] - (bps / 100) * r["cost_multiplier"] for r in records]
+            scenarios.append({
+                "scenario": label,
+                "cost_bps_per_leg_side": bps,
+                "illustrative_four_side_cost_pct": round(4 * bps / 100, 4),
+                "mean_net_pct": round(sum(values)/len(values), 6) if values else None,
+                "median_net_pct": round(sorted(values)[len(values)//2], 6) if values else None,
+                "positive_net_window_pct": round(100 * sum(v > 0 for v in values)/len(values), 2) if values else None,
+                "min_net_pct": round(min(values), 6) if values else None,
+                "max_net_pct": round(max(values), 6) if values else None,
+            })
+        analyses.append({
+            "hold_days": duration_days,
+            "sampled_windows": len(records),
+            "mean_funding_pct": round(sum(r["funding_pct"] for r in records)/len(records), 6) if records else None,
+            "mean_basis_pnl_pct": round(sum(r["basis_pnl_pct"] for r in records)/len(records), 6) if records else None,
+            "mean_gross_pct": round(sum(r["gross_pct"] for r in records)/len(records), 6) if records else None,
+            "cost_scenarios": scenarios,
+            "latest_window": {
+                k: round(v, 6) if isinstance(v, float) else v
+                for k, v in records[-1].items() if k != "cost_multiplier"
+            } if records else None,
+        })
+    return {
+        "project": "CRYPTO-RESEARCH-V1",
+        "version": "0.6.0",
+        "model": "FA_B_RETROSPECTIVE_CARRY_BASIS",
+        "symbol": symbol,
+        "days": days,
+        "sample_every_hours": sample_every_hours,
+        "paper_only": True,
+        "orders": False,
+        "matched_hourly_bars": len(common),
+        "historical_funding_events": len(events),
+        "analyses": analyses,
+        "limitations": [
+            "Retrospective sampled windows; no forward signal or tradable entry rule.",
+            "Windows overlap and are not independent; do not compound their returns.",
+            "Funding uses historical realized rates and hourly perp-open notional proxy, not exact funding mark.",
+            "Spot and perpetual hourly opens are not guaranteed simultaneous executable fills.",
+            "Cost scenarios include illustrative fees only; extra spread, slippage and market impact are excluded.",
+            "No margin, liquidation, financing, borrow, collateral, transfer or intratrade drawdown model.",
+            "Results are normalized to entry spot notional, not total committed capital.",
+            "Missing hourly data and large funding-event gaps cause windows to be excluded.",
+            "No orders, no live trading, no proof of future profitability.",
         ],
     }
