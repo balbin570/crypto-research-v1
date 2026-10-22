@@ -7,7 +7,7 @@ from typing import Literal
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="CRYPTO-RESEARCH-V1", version="0.4.0")
+app = FastAPI(title="CRYPTO-RESEARCH-V1", version="0.5.0")
 SPOT = "https://data-api.binance.vision"
 FUTURES = "https://fapi.binance.com"
 SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
@@ -28,11 +28,11 @@ def check_symbol(symbol: str):
 
 @app.get("/")
 def root():
-    return {"project": "CRYPTO-RESEARCH-V1", "mode": "RESEARCH_PAPER_ONLY", "orders": False, "routes": ["/health", "/mr/signal", "/funding/latest", "/mr/backtest", "/mr/cost-analysis", "/funding/backtest", "/docs"]}
+    return {"project": "CRYPTO-RESEARCH-V1", "mode": "RESEARCH_PAPER_ONLY", "orders": False, "routes": ["/health", "/mr/signal", "/funding/latest", "/mr/backtest", "/mr/cost-analysis", "/funding/backtest", "/funding/carry-analysis", "/docs"]}
 
 @app.get("/health")
 def health():
-    return {"status": "OK", "utc": datetime.now(timezone.utc).isoformat(), "paper_only": True, "trading": False, "orders": False, "version": "0.4.0"}
+    return {"status": "OK", "utc": datetime.now(timezone.utc).isoformat(), "paper_only": True, "trading": False, "orders": False, "version": "0.5.0"}
 
 @app.get("/mr/signal")
 async def mr_signal(symbol: str = Query("BTCUSDT"), interval: Literal["5m", "15m", "1h"] = "15m"):
@@ -256,7 +256,7 @@ async def mr_cost_analysis(
                 "max_closed_trade_drawdown_pct": r["summary"]["max_closed_trade_drawdown_pct"],
             })
     return {
-        "project": "CRYPTO-RESEARCH-V1", "version": "0.4.0",
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.5.0",
         "symbol": symbol, "interval": interval, "days": days,
         "data_bars": len(raw), "paper_only": True, "orders": False,
         "scenarios": results,
@@ -450,4 +450,104 @@ async def funding_backtest(
     }
 
 # Ensure the old routes remain unchanged. Version is informational only.
-app.version = '0.4.0'
+app.version = '0.5.0'
+
+
+# V0.5: Funding carry diagnostics, strictly descriptive and research-only.
+# All rolling windows are backward-looking, ending at a realized funding event.
+@app.get("/funding/carry-analysis")
+async def funding_carry_analysis(
+    symbol: Literal["BTCUSDT", "ETHUSDT", "SOLUSDT"] = "BTCUSDT",
+    days: int = Query(180, ge=30, le=365),
+    cost_bps_per_leg_side: float = Query(10.0, ge=0, le=50),
+):
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_ms = now_ms - days * 86_400_000
+    # 14 days of extra history so the earliest windows can be fully formed.
+    events = await _funding_history(symbol, start_ms - 14 * 86_400_000, now_ms)
+    events = [(t, r) for t, r in events if t < now_ms]
+    in_period = [(t, r) for t, r in events if t >= start_ms]
+    if len(in_period) < 15:
+        raise HTTPException(503, "Funding analizi için yeterli tarihsel kayıt yok")
+
+    def round_or_none(value, digits=6):
+        return round(value, digits) if value is not None else None
+
+    positive = sum(r > 0 for _, r in in_period)
+    negative = sum(r < 0 for _, r in in_period)
+    zero = len(in_period) - positive - negative
+    streaks = []
+    streak_sign, streak_len = None, 0
+    for _, r in in_period:
+        sign = "positive" if r > 0 else "negative" if r < 0 else "zero"
+        if sign == streak_sign:
+            streak_len += 1
+        else:
+            if streak_sign is not None:
+                streaks.append((streak_sign, streak_len))
+            streak_sign, streak_len = sign, 1
+    if streak_sign is not None:
+        streaks.append((streak_sign, streak_len))
+
+    # Funding rate is a fraction; sum * 100 expresses percentage points of
+    # approximate funding return on a constant perp notional. This does NOT
+    # include changes in mark notional, basis, fees, or liquidation risk.
+    windows = []
+    for window_days in (3, 7, 14):
+        duration_ms = window_days * 86_400_000
+        observations = []
+        for end_t, _ in in_period:
+            left = end_t - duration_ms
+            subset = [(t, r) for t, r in events if left < t <= end_t]
+            # Require at least one event per day; do not interpret missing
+            # history as zero funding. Intervals vary by instrument/time.
+            if len(subset) < window_days:
+                continue
+            # Reject windows with unexplained gaps longer than 36 hours.
+            timestamps = [t for t, _ in subset]
+            if any(b - a > 36 * 3_600_000 for a, b in zip(timestamps, timestamps[1:])):
+                continue
+            total_pct = sum(r for _, r in subset) * 100
+            observations.append((end_t, total_pct, len(subset)))
+        values = [x[1] for x in observations]
+        avg = sum(values) / len(values) if values else None
+        latest = observations[-1] if observations else None
+        # 4 sides x spot/perp notional assumed approximately equal.
+        assumed_round_trip_cost_pct = 4 * cost_bps_per_leg_side / 100
+        windows.append({
+            "days": window_days,
+            "completed_rolling_windows": len(values),
+            "mean_cumulative_funding_pct": round_or_none(avg),
+            "median_cumulative_funding_pct": round_or_none(sorted(values)[len(values)//2] if values else None),
+            "min_cumulative_funding_pct": round_or_none(min(values) if values else None),
+            "max_cumulative_funding_pct": round_or_none(max(values) if values else None),
+            "positive_window_pct": round_or_none(100 * sum(v > 0 for v in values) / len(values), 2) if values else None,
+            "latest_window_end_utc": datetime.fromtimestamp(latest[0]/1000, timezone.utc).isoformat() if latest else None,
+            "latest_window_funding_pct": round_or_none(latest[1]) if latest else None,
+            "latest_window_funding_events": latest[2] if latest else None,
+            "illustrative_four_side_cost_pct": round(assumed_round_trip_cost_pct, 6),
+            "latest_funding_minus_cost_pct": round_or_none(latest[1] - assumed_round_trip_cost_pct) if latest else None,
+        })
+    return {
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.5.0",
+        "model": "FA_B_FUNDING_PERSISTENCE_DIAGNOSTIC",
+        "symbol": symbol, "days": days, "paper_only": True, "orders": False,
+        "period_funding_events": len(in_period),
+        "funding_signs": {"positive": positive, "negative": negative, "zero": zero,
+                          "positive_pct": round(100 * positive / len(in_period), 2)},
+        "streaks_in_events": {
+            "longest_positive": max((n for sign, n in streaks if sign == "positive"), default=0),
+            "longest_negative": max((n for sign, n in streaks if sign == "negative"), default=0),
+        },
+        "rolling_windows": windows,
+        "parameters": {"cost_bps_per_leg_side": cost_bps_per_leg_side},
+        "limitations": [
+            "Descriptive retrospective funding diagnostics, NOT a tradable backtest or a forward signal.",
+            "Rolling windows overlap heavily; their observations are not independent.",
+            "Cumulative funding assumes constant perpetual notional and historical realized rates.",
+            "Cost is illustrative: four fills at the same per-leg per-side bps, without dynamic notional.",
+            "No spot/perp basis PnL, spreads, slippage, borrow, margin, liquidation or collateral modeling.",
+            "Funding settlement intervals can vary; data completeness is approximated by event count and gaps.",
+            "A positive funding-minus-cost figure does not establish arbitrage profitability.",
+        ],
+    }
