@@ -28,7 +28,7 @@ def check_symbol(symbol: str):
 
 @app.get("/")
 def root():
-    return {"project": "CRYPTO-RESEARCH-V1", "mode": "RESEARCH_PAPER_ONLY", "orders": False, "routes": ["/health", "/mr/signal", "/funding/latest", "/mr/backtest", "/mr/cost-analysis", "/funding/backtest", "/funding/carry-analysis", "/funding/carry-basis-analysis", "/docs"]}
+    return {"project": "CRYPTO-RESEARCH-V1", "mode": "RESEARCH_PAPER_ONLY", "orders": False, "routes": ["/health", "/mr/signal", "/funding/latest", "/mr/backtest", "/mr/cost-analysis", "/funding/backtest", "/funding/carry-analysis", "/funding/carry-basis-analysis", "/funding/carry-backtest", "/docs"]}
 
 @app.get("/health")
 def health():
@@ -452,7 +452,7 @@ async def funding_backtest(
     }
 
 # Ensure the old routes remain unchanged. Version is informational only.
-app.version = '0.6.2'
+app.version = '0.7.0'
 
 
 # V0.5: Funding carry diagnostics, strictly descriptive and research-only.
@@ -706,5 +706,143 @@ async def funding_carry_basis_analysis(
             "Results are normalized to entry spot notional, not total committed capital.",
             "Missing daily data and large funding-event gaps cause windows to be excluded.",
             "No orders, no live trading, no proof of future profitability.",
+        ],
+    }
+
+
+# V0.7: chronological, non-overlapping carry backtest.
+# The entry decision uses ONLY the previous seven days of realized funding.
+@app.get("/funding/carry-backtest")
+async def funding_carry_backtest(
+    symbol: Literal["BTCUSDT", "ETHUSDT", "SOLUSDT"] = "BTCUSDT",
+    days: int = Query(180, ge=120, le=180),
+    lookback_days: int = Query(7, ge=3, le=14),
+    min_past_funding_pct: float = Query(0.05, ge=0, le=1),
+):
+    import asyncio
+    import bisect
+    DAY = 86_400_000
+    HOUR = 3_600_000
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    end = (now_ms // DAY - 1) * DAY
+    start = end - days * DAY
+    warmup = start - (lookback_days + 2) * DAY
+    spot, perp, events = await asyncio.gather(
+        _daily_history(SPOT, symbol, warmup, end, "/api/v3/klines"),
+        _daily_history(FUTURES, symbol, warmup, end, "/fapi/v1/klines"),
+        _funding_history(symbol, warmup, end),
+    )
+    times = [t for t, _ in events]
+    if len(spot.keys() & perp.keys()) < days * 0.9 or len(events) < days:
+        raise HTTPException(503, "Yeterli tarihsel veri bulunamadı")
+    split = start + (days * 2 // 3) * DAY
+    cost_scenarios = [("low", 2.0), ("medium", 4.0), ("baseline", 10.0)]
+    results = []
+    for hold_days in (30, 45):
+        trades = []
+        entry = start
+        while entry + hold_days * DAY <= end:
+            exit_t = entry + hold_days * DAY
+            if any(t not in spot or t not in perp for t in range(entry, exit_t + DAY, DAY)):
+                entry += DAY
+                continue
+            s0, s1, f0, f1 = spot[entry], spot[exit_t], perp[entry], perp[exit_t]
+            if min(s0, s1, f0, f1) <= 0:
+                entry += DAY
+                continue
+            # Known-at-entry trailing realized funding, strictly before entry.
+            prior = events[bisect.bisect_left(times, entry - lookback_days * DAY):
+                           bisect.bisect_left(times, entry)]
+            prior_times = [entry - lookback_days * DAY] + [t for t, _ in prior] + [entry]
+            if len(prior) < lookback_days or any(
+                b - a > 36 * HOUR for a, b in zip(prior_times, prior_times[1:])
+            ):
+                entry += DAY
+                continue
+            trailing_pct = sum(rate * 100 for _, rate in prior)
+            if trailing_pct < min_past_funding_pct:
+                entry += DAY
+                continue
+            # Split classification uses entry timestamp, not exit timestamp.
+            # Trades crossing split are omitted to keep train/test separated.
+            if entry < split < exit_t:
+                entry = split
+                continue
+            actual = events[bisect.bisect_right(times, entry):
+                            bisect.bisect_right(times, exit_t)]
+            gaps = [entry] + [t for t, _ in actual] + [exit_t]
+            if len(actual) < hold_days or any(
+                b - a > 36 * HOUR for a, b in zip(gaps, gaps[1:])
+            ):
+                entry += DAY
+                continue
+            funding = 0.0
+            valid = True
+            for t, rate in actual:
+                daily_t = (t // DAY) * DAY
+                if daily_t not in perp:
+                    valid = False
+                    break
+                funding += 100 * rate * perp[daily_t] / s0
+            if not valid:
+                entry += DAY
+                continue
+            basis = 100 * ((s1 - s0) + (f0 - f1)) / s0
+            four_fill_notional = 1 + s1/s0 + f0/s0 + f1/s0
+            trades.append({
+                "entry_utc": datetime.fromtimestamp(entry/1000, timezone.utc).isoformat(),
+                "exit_utc": datetime.fromtimestamp(exit_t/1000, timezone.utc).isoformat(),
+                "partition": "development" if exit_t <= split else "validation",
+                "past_funding_pct_at_entry": round(trailing_pct, 6),
+                "realized_funding_pct": round(funding, 6),
+                "basis_pnl_pct": round(basis, 6),
+                "gross_pct": round(funding+basis, 6),
+                "_gross": funding+basis,
+                "_notional": four_fill_notional,
+            })
+            entry = exit_t + DAY  # no overlap, one calendar-day cooldown
+
+        summaries = []
+        for partition in ("development", "validation"):
+            subset = [t for t in trades if t["partition"] == partition]
+            for label, bps in cost_scenarios:
+                returns = [t["_gross"] - bps / 100 * t["_notional"] for t in subset]
+                equity, peak, max_dd = 1.0, 1.0, 0.0
+                for r in returns:
+                    equity *= (1 + r / 100)
+                    peak = max(peak, equity)
+                    max_dd = max(max_dd, (peak - equity) / peak * 100)
+                summaries.append({
+                    "partition": partition, "cost_scenario": label,
+                    "cost_bps_per_leg_side": bps,
+                    "trades": len(returns),
+                    "mean_net_pct": round(sum(returns)/len(returns), 6) if returns else None,
+                    "positive_trade_pct": round(100*sum(r>0 for r in returns)/len(returns), 2) if returns else None,
+                    "illustrative_compounded_pct": round(100*(equity-1), 6) if returns else None,
+                    "max_closed_trade_drawdown_pct": round(max_dd, 6) if returns else None,
+                })
+        results.append({
+            "hold_days": hold_days,
+            "total_nonoverlapping_trades": len(trades),
+            "summaries": summaries,
+            "trades": [{k: v for k, v in t.items() if not k.startswith("_")} for t in trades],
+        })
+    return {
+        "project": "CRYPTO-RESEARCH-V1", "version": "0.7.0",
+        "model": "FA_B_CHRONOLOGICAL_PAPER_BACKTEST",
+        "symbol": symbol, "days": days,
+        "lookback_days": lookback_days,
+        "min_past_funding_pct": min_past_funding_pct,
+        "development_validation_split_utc": datetime.fromtimestamp(split/1000, timezone.utc).isoformat(),
+        "paper_only": True, "orders": False, "results": results,
+        "limitations": [
+            "Entry rule is fixed, uses only realized historical funding known before entry.",
+            "Chronological split does not guarantee independent market regimes; very few trades expected.",
+            "Parameters and durations were inspired by prior analysis of overlapping windows: validation is NOT fully untouched.",
+            "Daily open prices are approximate simultaneous fills; funding notional uses daily perp-open proxy.",
+            "Cost model covers illustrative four-fill fees, not extra slippage/spread/market impact.",
+            "No intratrade basis drawdown, margin, liquidation, financing, collateral, borrowing or transfer model.",
+            "Returns normalized to spot entry notional, not total capital; compounding is illustrative.",
+            "Funding is realized after entry; not known in advance. No live orders or profitability guarantee.",
         ],
     }
