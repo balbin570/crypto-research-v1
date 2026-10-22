@@ -1533,3 +1533,123 @@ async def funding_cost_collateral_analysis(
             'Research only; no live trading, no orders.'
         ]
     }
+
+
+# V1.3 — historical funding-event integrity and execution-cost audit.
+# Uses archived funding timestamps/rates, never invents settlement prices.
+@app.get("/funding/v13-audit")
+async def funding_v13_audit(
+    symbol: Literal["BTCUSDT", "ETHUSDT", "SOLUSDT"] = "BTCUSDT",
+    days: int = Query(1095, ge=365, le=1095),
+    fee_per_fill_bps: float = Query(10.0, ge=0, le=50),
+    slippage_per_fill_bps: float = Query(2.0, ge=0, le=50),
+    financing_annual_pct: float = Query(0.0, ge=0, le=30),
+):
+    import bisect
+    from collections import defaultdict
+    DAY = 86400000
+    prior = await funding_yearly_risk(symbol=symbol, days=days)
+    trades = [t for strategy in prior["results"] for t in strategy["trades"]]
+    if not trades:
+        raise HTTPException(503, "No historical trades available")
+    def millis(value):
+        return int(datetime.fromisoformat(value).timestamp()*1000)
+    earliest = min(millis(t["entry_utc"]) for t in trades)
+    latest = max(millis(t["exit_utc"]) for t in trades)
+    spot, perp, events = await _archive_bundle(symbol, earliest-DAY, latest+DAY)
+    times = [t for t, _ in events]
+    yearly = defaultdict(list)
+    gaps = []
+    unusual_timestamps = []
+    duplicate_count = 0
+    seen = set()
+    for ts, rate in events:
+        if ts in seen:
+            duplicate_count += 1
+        seen.add(ts)
+        yearly[datetime.fromtimestamp(ts/1000, timezone.utc).year].append(rate)
+        if ts % (3600*1000) != 0:
+            unusual_timestamps.append(datetime.fromtimestamp(ts/1000, timezone.utc).isoformat())
+    for (t0,_),(t1,_) in zip(events,events[1:]):
+        hours=(t1-t0)/3600000
+        if hours>25:
+            gaps.append({"from_utc":datetime.fromtimestamp(t0/1000,timezone.utc).isoformat(),
+                         "to_utc":datetime.fromtimestamp(t1/1000,timezone.utc).isoformat(),
+                         "hours":round(hours,2)})
+    strategies=[]
+    for strategy in prior["results"]:
+        enriched=[]
+        for t in strategy["trades"]:
+            a,b=millis(t["entry_utc"]),millis(t["exit_utc"])
+            event_slice=events[bisect.bisect_right(times,a):bisect.bisect_left(times,b)]
+            # Event-rate sum is exact for the archive; funding P&L is not, without
+            # settlement-time perp mark and position sizing history.
+            raw_funding_rate_sum_pct=100*sum(rate for _,rate in event_slice)
+            total_exec_cost_pct=(fee_per_fill_bps+slippage_per_fill_bps)/10.0 * t["four_fill_fee_baseline_pct"]
+            financing_cost_pct=financing_annual_pct*t["days_held"]/365.0
+            net=t["gross_pct"]-total_exec_cost_pct-financing_cost_pct
+            enriched.append({
+                "entry_utc":t["entry_utc"],"exit_utc":t["exit_utc"],
+                "partition":t["partition"],"exit_year":int(t["exit_utc"][:4]),
+                "days_held":t["days_held"],"funding_events":len(event_slice),
+                "raw_funding_rate_sum_pct":round(raw_funding_rate_sum_pct,6),
+                "daily_open_estimated_funding_pnl_pct":t["funding_pct"],
+                "estimated_basis_pct":t["basis_pct"],
+                "execution_cost_pct":round(total_exec_cost_pct,6),
+                "financing_cost_pct":round(financing_cost_pct,6),
+                "scenario_net_pct_spot_notional":round(net,6),
+                "settlement_price_verified":False
+            })
+        summaries=[]
+        for group_name,subset in [
+            ("development",[t for t in enriched if t["partition"]=="development"]),
+            ("validation",[t for t in enriched if t["partition"]=="validation"])
+        ] + [(str(y),[t for t in enriched if t["exit_year"]==y])
+             for y in sorted({t["exit_year"] for t in enriched})]:
+            if not subset:
+                continue
+            summaries.append({
+                "period":group_name,"trades":len(subset),
+                "mean_net_pct_spot_notional":round(sum(t["scenario_net_pct_spot_notional"] for t in subset)/len(subset),6),
+                "win_rate_pct":round(100*sum(t["scenario_net_pct_spot_notional"]>0 for t in subset)/len(subset),2),
+                "mean_raw_funding_rate_sum_pct":round(sum(t["raw_funding_rate_sum_pct"] for t in subset)/len(subset),6),
+                "mean_estimated_funding_pnl_pct":round(sum(t["daily_open_estimated_funding_pnl_pct"] for t in subset)/len(subset),6),
+                "mean_execution_cost_pct":round(sum(t["execution_cost_pct"] for t in subset)/len(subset),6)
+            })
+        strategies.append({"exit_rule":strategy["exit_rule"],"hold_days":45,
+                           "summaries":summaries,"trades":enriched})
+    return {
+        "project":"CRYPTO-RESEARCH-V1","version":"1.3.0",
+        "model":"FA_B_FUNDING_DATA_AND_COST_AUDIT","paper_only":True,"orders":False,
+        "symbol":symbol,"days":days,
+        "inputs":{"fee_per_fill_bps":fee_per_fill_bps,
+                  "slippage_per_fill_bps":slippage_per_fill_bps,
+                  "financing_annual_pct":financing_annual_pct},
+        "archive_quality":{
+            "funding_event_count":len(events),
+            "unique_funding_timestamps":len(seen),
+            "duplicate_timestamps":duplicate_count,
+            "non_hour_aligned_timestamps_sample":unusual_timestamps[:10],
+            "gaps_over_25h_count":len(gaps),
+            "gaps_over_25h_sample":gaps[:12],
+            "funding_by_year":[{"year":y,"events":len(rates),
+                                "positive_pct":round(100*sum(r>0 for r in rates)/len(rates),2),
+                                "negative_pct":round(100*sum(r<0 for r in rates)/len(rates),2),
+                                "sum_raw_rates_pct":round(100*sum(rates),6)}
+                               for y,rates in sorted(yearly.items())],
+            "daily_spot_open_rows":len(spot),"daily_perp_open_rows":len(perp),
+            "settlement_time_perp_prices_available":False
+        },
+        "strategies":strategies,
+        "limitations":[
+            "Funding event timestamps and rates are read from Binance Vision monthly archives.",
+            "Settlement-time perp mark prices are NOT present in the daily-open archive.",
+            "Raw funding rate sums are exact sums of archived rates, NOT exact funding cashflow.",
+            "Funding cashflow and basis P&L retain V1.1 daily-open approximations.",
+            "Fees, slippage, and financing are user-selected assumptions, not verified exchange quotes.",
+            "No margin, liquidation, intraday exposure or funding-payment cash ledger.",
+            "Archive quality checks do not establish exchange-level reconciliation.",
+            "Development and validation periods were previously inspected; not independent proof.",
+            "Paper research only. No orders or trading."
+        ]
+    }
