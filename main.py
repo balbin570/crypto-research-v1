@@ -7,7 +7,7 @@ from typing import Literal
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="CRYPTO-RESEARCH-V1", version="1.9.0")
+app = FastAPI(title="CRYPTO-RESEARCH-V1", version="2.0.0")
 SPOT = "https://data-api.binance.vision"
 FUTURES = "https://fapi.binance.com"
 SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
@@ -2441,4 +2441,105 @@ async def funding_v19_risk_audit(
             'No borrowing assumes fully funded spot and does not include opportunity cost.',
             'PAPER ONLY; NO ORDERS.'
         ]
+    }
+
+
+# V2.0: fully cash-funded research; no trading and no account access.
+@app.get("/funding/v20-capital-comparison")
+async def funding_v20_capital_comparison(
+    symbol: Literal["BTCUSDT","ETHUSDT","SOLUSDT"]="BTCUSDT",
+    days: int=Query(1095,ge=365,le=1095),
+    starting_capital_usdt: float=Query(10000.0,gt=0,le=100000000),
+    spot_notional_usdt: float=Query(1000.0,gt=0,le=1000000),
+    maintenance_margin_fraction: float=Query(0.005,ge=0,le=0.2),
+):
+    import statistics
+    base=await funding_v15_comparison(symbol=symbol,days=days,
+        fee_per_fill_bps=0.0,slippage_per_fill_bps=0.0,financing_annual_pct=0.0)
+    rows=[r for r in base["monthly_matched_entries"] if r["horizon_days"]==45]
+    if not rows:
+        raise HTTPException(status_code=503,detail="45 günlük tarihsel örnek bulunamadı")
+    strategies={
+        "ALL_MONTHLY":lambda r:True,
+        "PRIOR_7D_POSITIVE":lambda r:r["prior_7d_raw_rate_pct"]>0,
+        "PRIOR_30D_GE_0_30PCT":lambda r:r["prior_30d_raw_rate_pct"]>=0.30,
+    }
+    # Collateral is assumed to be transferred BEFORE the price shock.
+    # No dynamic margin calls or path-dependent liquidation simulation.
+    collateral_cases=[
+        ("MARGIN_25_RESERVE_25",0.25,0.25),
+        ("MARGIN_50_RESERVE_25",0.50,0.25),
+        ("MARGIN_75_RESERVE_25",0.75,0.25),
+        ("MARGIN_100_RESERVE_25",1.00,0.25),
+        ("MARGIN_100_RESERVE_50",1.00,0.50),
+    ]
+    cost_cases=[("LOW",2.0,1.0),("BASE",10.0,2.0),("HIGH",15.0,5.0)]
+    shocks=[10,20,30,50,75,100]
+    out=[]
+    for cname,margin,reserve in collateral_cases:
+        allocated=spot_notional_usdt*(1+margin+reserve)
+        max_positions=int(starting_capital_usdt//allocated)
+        threshold=100*(margin+reserve-maintenance_margin_fraction)/(1+maintenance_margin_fraction)
+        for strategy,eligible in strategies.items():
+            chosen=[r for r in rows if eligible(r)]
+            recent=[r for r in chosen if r["entry_utc"]>="2025-01-01"]
+            for cost_name,fee,slip in cost_cases:
+                # Approximation: four fills at entry notional. V1.5 can calculate
+                # individual actual-notional fees, but these scenarios use flat costs.
+                exec_pct=4*(fee+slip)/100
+                vals=[r["net_proxy_pct"]-exec_pct for r in recent]
+                all_vals=[r["net_proxy_pct"]-exec_pct for r in chosen]
+                total=sum(vals)*spot_notional_usdt/100
+                out.append({
+                    "collateral_case":cname,"strategy":strategy,"cost_case":cost_name,
+                    "margin_fraction":margin,"reserve_fraction":reserve,
+                    "locked_capital_per_position_usdt":round(allocated,2),
+                    "static_max_simultaneous_positions":max_positions,
+                    "approx_up_move_to_maintenance_pct":round(threshold,4),
+                    "shock_survival_if_all_reserve_pretransferred":{
+                        str(shock):shock<threshold for shock in shocks},
+                    "recent_trades":len(vals),
+                    "recent_2025_2026_proxy_total_usdt_fixed_notional":round(total,4),
+                    "recent_mean_proxy_pct_on_spot_notional":round(statistics.mean(vals),6) if vals else None,
+                    "recent_mean_proxy_pct_on_allocated_capital":round(statistics.mean(vals)*spot_notional_usdt/allocated,6) if vals else None,
+                    "full_sample_trades":len(all_vals),
+                    "full_sample_proxy_total_usdt_fixed_notional":round(sum(all_vals)*spot_notional_usdt/100,4),
+                    "financing_annual_pct":0,
+                    "execution_cost_pct_spot_notional":round(exec_pct,4),
+                })
+    return {
+        "project":"CRYPTO-RESEARCH-V1","version":"2.0.0",
+        "model":"CASH_FUNDED_COLLATERAL_AND_RECENT_RETURN_SENSITIVITY",
+        "paper_only":True,"trading":False,"orders":False,
+        "symbol":symbol,"days":days,
+        "starting_capital_usdt":starting_capital_usdt,
+        "spot_notional_usdt":spot_notional_usdt,
+        "funding_verification":{
+            "status":"NOT_VERIFIED_PROXY_ONLY",
+            "settlement_mark_prices_verified":False,
+            "actual_account_funding_ledger_verified":False,
+            "funding_rate_history_is_not_cashflow":True,
+            "required_for_reconciliation":[
+                "timestamped settlement mark price",
+                "position quantity at each settlement",
+                "signed actual account funding ledger",
+            ],
+        },
+        "source_audit":base["data_audit"],
+        "cost_cases":[{"name":n,"fee_per_fill_bps":f,"slippage_per_fill_bps":s}
+                      for n,f,s in cost_cases],
+        "collateral_cases":[{"name":n,"margin_fraction":m,"reserve_fraction":r}
+                            for n,m,r in collateral_cases],
+        "scenarios":out,
+        "limitations":[
+            "Funding uses daily-open proxy; no actual settlement cashflow verification.",
+            "Collateral is assumed transferred before shock; intraday liquidation is NOT simulated.",
+            "Approximate maintenance threshold is NOT a Binance liquidation price.",
+            "Return estimates exclude opportunity cost of fully funded spot.",
+            "Four execution fills priced at entry notional; actual notional, spreads, fees differ.",
+            "Collateral changes denominators, not trading edge; scenarios are not independent.",
+            "Summed PnL is NOT portfolio equity, CAGR, or executable profit.",
+            "No margin calls, intraday path, mark/index divergence, basis stress, ADL.",
+            "PAPER ONLY; NO ORDERS.",
+        ],
     }
